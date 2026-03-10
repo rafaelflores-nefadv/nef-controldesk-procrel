@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Relatórios Excel</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <main class="page">
+        <section class="panel">
+            <p class="eyebrow">FastAPI + Excel</p>
+            <h1>Processamento de relatórios</h1>
+            <p class="intro">
+                Envie os arquivos do tipo selecionado e o relatório processado será baixado automaticamente.
+            </p>
+
+            <form id="upload-form" novalidate>
+                <div class="field">
+                    <label for="tipo">Tipo de processamento</label>
+                    <select id="tipo" name="tipo">
+                        <option value="planalto">Planalto</option>
+                        <option value="sudoeste">Sudoeste</option>
+                    </select>
+                </div>
+
+                <div class="requirements">
+                    <strong>Arquivos obrigatórios</strong>
+                    <p id="requirements-text"></p>
+                </div>
+
+                <div id="inputs-container" class="inputs-grid"></div>
+
+                <div id="message" class="message" aria-live="polite"></div>
+
+                <button id="submit-button" type="submit">Enviar arquivos</button>
+            </form>
+        </section>
+    </main>
+
+    <script src="/static/app.js" defer></script>
+</body>
+</html>
