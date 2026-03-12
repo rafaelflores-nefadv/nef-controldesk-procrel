@@ -1,13 +1,21 @@
 from pathlib import Path
+import logging
+from typing import Callable
+import uuid
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
+
+from .logging_utils import bind_log_context, configure_logging, log_exception, log_info, log_warning, reset_log_context
 from .planalto import processar_planalto
 from .sudoeste import processar_sudoeste
 from .sudoeste_consolidado import processar_sudoeste_consolidado
 from .sudoeste_direto import processar_sudoeste_direto
 from .sudoeste_indireto import processar_sudoeste_indireto
+
+configure_logging()
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -31,113 +39,194 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 async def index():
     return FileResponse(STATIC_DIR / "index.html")
 
+
+def _extract_file_name(upload: UploadFile | None) -> str | None:
+    if upload is None:
+        return None
+    if upload.filename and upload.filename.strip():
+        return upload.filename
+    return None
+
+
+def _get_missing_fields(uploads: dict[str, UploadFile | None]) -> list[str]:
+    return [field for field, upload in uploads.items() if _extract_file_name(upload) is None]
+
+
+async def _read_upload_bytes(
+    fluxo: str,
+    request_id: str,
+    field_name: str,
+    upload: UploadFile,
+) -> bytes:
+    try:
+        content = await upload.read()
+    except Exception:
+        log_exception(
+            logger,
+            "Falha ao ler arquivo enviado",
+            fluxo=fluxo,
+            campo=field_name,
+            arquivo=upload.filename,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"Nao foi possivel ler o arquivo '{field_name}' no fluxo {fluxo}. request_id={request_id}",
+        )
+
+    log_info(
+        logger,
+        "Arquivo lido com sucesso",
+        fluxo=fluxo,
+        campo=field_name,
+        arquivo=upload.filename,
+        tamanho_bytes=len(content),
+        content_type=upload.content_type,
+    )
+    return content
+
+
+async def _executar_fluxo_upload(
+    fluxo: str,
+    uploads: dict[str, UploadFile | None],
+    processor: Callable[..., object],
+    output_filename: str,
+) -> StreamingResponse:
+    request_id = uuid.uuid4().hex
+    context_token = bind_log_context(request_id=request_id, fluxo=fluxo)
+
+    try:
+        expected_fields = list(uploads.keys())
+        received_files = {field: _extract_file_name(upload) for field, upload in uploads.items()}
+
+        log_info(
+            logger,
+            "Recebida requisicao de processamento",
+            campos_esperados=expected_fields,
+        )
+        log_info(
+            logger,
+            "Arquivos recebidos na requisicao",
+            arquivos=received_files,
+        )
+
+        missing_fields = _get_missing_fields(uploads)
+        if missing_fields:
+            detail = (
+                f"Fluxo {fluxo} recebeu campos incompletos. "
+                f"Faltando: {', '.join(missing_fields)}. request_id={request_id}"
+            )
+            log_warning(
+                logger,
+                "Campos ausentes na requisicao",
+                campos_ausentes=missing_fields,
+            )
+            raise HTTPException(status_code=422, detail=detail)
+
+        log_info(logger, "Validacao de campos obrigatorios concluida")
+
+        try:
+            payload = {
+                field_name: await _read_upload_bytes(fluxo, request_id, field_name, upload)
+                for field_name, upload in uploads.items()
+                if upload is not None
+            }
+            log_info(logger, "Iniciando processamento do fluxo")
+
+            resultado = processor(**payload)
+            output_size = len(resultado.getbuffer()) if hasattr(resultado, "getbuffer") else None
+
+            log_info(
+                logger,
+                "Processamento concluido com sucesso",
+                arquivo_saida=output_filename,
+                tamanho_saida_bytes=output_size,
+            )
+
+            return StreamingResponse(
+                resultado,
+                media_type=EXCEL_MEDIA_TYPE,
+                headers={
+                    "Content-Disposition": f"attachment; filename={output_filename}",
+                    "X-Request-ID": request_id,
+                },
+            )
+        except HTTPException:
+            raise
+        except Exception:
+            log_exception(logger, "Erro ao processar fluxo")
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Erro interno ao processar fluxo {fluxo}. "
+                    f"Verifique os arquivos enviados. request_id={request_id}"
+                ),
+            )
+    finally:
+        reset_log_context(context_token)
+
+
 @app.post("/planalto")
 async def planalto(
-    recebimento: UploadFile = File(...),
-    pagamento: UploadFile = File(...)
+    recebimento: UploadFile | None = File(None),
+    pagamento: UploadFile | None = File(None),
 ):
-    try:
-        recebimento_bytes = await recebimento.read()
-        pagamento_bytes = await pagamento.read()
-
-        resultado = processar_planalto(recebimento_bytes, pagamento_bytes)
-
-        return StreamingResponse(
-            resultado,
-            media_type=EXCEL_MEDIA_TYPE,
-            headers={"Content-Disposition": "attachment; filename=planalto_processado.xlsx"}
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao processar arquivo: {str(e)}")
+    return await _executar_fluxo_upload(
+        fluxo="planalto",
+        uploads={"recebimento": recebimento, "pagamento": pagamento},
+        processor=processar_planalto,
+        output_filename="planalto_processado.xlsx",
+    )
 
 
 @app.post("/sudoeste")
 async def sudoeste(
-    base: UploadFile = File(...),
-    recebimento: UploadFile = File(...),
-    denodo: UploadFile = File(...)
+    base: UploadFile | None = File(None),
+    recebimento: UploadFile | None = File(None),
+    denodo: UploadFile | None = File(None),
 ):
-    try:
-        base_bytes = await base.read()
-        recebimento_bytes = await recebimento.read()
-        denodo_bytes = await denodo.read()
-
-        resultado = processar_sudoeste(
-            base_bytes,
-            recebimento_bytes,
-            denodo_bytes
-        )
-
-        return StreamingResponse(
-            resultado,
-            media_type=EXCEL_MEDIA_TYPE,
-            headers={"Content-Disposition": "attachment; filename=sudoeste_inicial_processado.xlsx"}
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao processar arquivo: {str(e)}")
+    return await _executar_fluxo_upload(
+        fluxo="sudoeste-inicial",
+        uploads={"base": base, "recebimento": recebimento, "denodo": denodo},
+        processor=processar_sudoeste,
+        output_filename="sudoeste_inicial_processado.xlsx",
+    )
 
 
 @app.post("/sudoeste-direto")
 async def sudoeste_direto(
-    processada: UploadFile = File(...),
-    direta: UploadFile = File(...)
+    processada: UploadFile | None = File(None),
+    direta: UploadFile | None = File(None),
 ):
-    try:
-        processada_bytes = await processada.read()
-        direta_bytes = await direta.read()
-
-        resultado = processar_sudoeste_direto(processada_bytes, direta_bytes)
-
-        return StreamingResponse(
-            resultado,
-            media_type=EXCEL_MEDIA_TYPE,
-            headers={"Content-Disposition": "attachment; filename=sudoeste_direto_processado.xlsx"}
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao processar arquivo: {str(e)}")
+    return await _executar_fluxo_upload(
+        fluxo="sudoeste-direto",
+        uploads={"processada": processada, "direta": direta},
+        processor=processar_sudoeste_direto,
+        output_filename="sudoeste_direto_processado.xlsx",
+    )
 
 
 @app.post("/sudoeste-indireto")
 async def sudoeste_indireto(
-    processada: UploadFile = File(...),
-    indireto: UploadFile = File(...)
+    processada: UploadFile | None = File(None),
+    indireto: UploadFile | None = File(None),
 ):
-    try:
-        processada_bytes = await processada.read()
-        indireto_bytes = await indireto.read()
-
-        resultado = processar_sudoeste_indireto(processada_bytes, indireto_bytes)
-
-        return StreamingResponse(
-            resultado,
-            media_type=EXCEL_MEDIA_TYPE,
-            headers={"Content-Disposition": "attachment; filename=sudoeste_indireto_processado.xlsx"}
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao processar arquivo: {str(e)}")
+    return await _executar_fluxo_upload(
+        fluxo="sudoeste-indireto",
+        uploads={"processada": processada, "indireto": indireto},
+        processor=processar_sudoeste_indireto,
+        output_filename="sudoeste_indireto_processado.xlsx",
+    )
 
 
 @app.post("/sudoeste-consolidado")
 async def sudoeste_consolidado(
-    processada: UploadFile = File(...),
-    direta: UploadFile = File(...),
-    indireto: UploadFile = File(...)
+    processada: UploadFile | None = File(None),
+    direta: UploadFile | None = File(None),
+    indireto: UploadFile | None = File(None),
 ):
-    try:
-        processada_bytes = await processada.read()
-        direta_bytes = await direta.read()
-        indireto_bytes = await indireto.read()
-
-        resultado = processar_sudoeste_consolidado(
-            processada_bytes,
-            direta_bytes,
-            indireto_bytes,
-        )
-
-        return StreamingResponse(
-            resultado,
-            media_type=EXCEL_MEDIA_TYPE,
-            headers={"Content-Disposition": "attachment; filename=sudoeste_consolidado_processado.xlsx"}
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao processar arquivo: {str(e)}")
+    return await _executar_fluxo_upload(
+        fluxo="sudoeste-consolidado",
+        uploads={"processada": processada, "direta": direta, "indireto": indireto},
+        processor=processar_sudoeste_consolidado,
+        output_filename="sudoeste_consolidado_processado.xlsx",
+    )

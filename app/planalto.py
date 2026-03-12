@@ -7,8 +7,10 @@ import numpy as np
 import pandas as pd
 from openpyxl.styles import Font, PatternFill
 
+from .logging_utils import configure_logging, log_info
+
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+configure_logging()
 
 OUTPUT_COLUMNS = [
     "AG",
@@ -365,7 +367,7 @@ def _exportar_planalto(dataframe: pd.DataFrame) -> io.BytesIO:
 
 
 def processar_planalto(recebimento: bytes, pagamento: bytes) -> io.BytesIO:
-    logger.info("=" * 10)
+    log_info(logger, "Iniciando fluxo planalto")
 
     df_recebimento = _ler_recebimento(recebimento)
     df_pagamento = pd.read_excel(io.BytesIO(pagamento))

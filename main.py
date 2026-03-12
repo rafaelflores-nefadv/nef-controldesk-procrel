@@ -1,7 +1,9 @@
 import logging
 
+from app.logging_utils import configure_logging
+
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+configure_logging()
 
 
 if __name__ == "__main__":

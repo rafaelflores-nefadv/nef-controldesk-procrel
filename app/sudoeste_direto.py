@@ -1,9 +1,11 @@
 import io
+import logging
 from collections import OrderedDict
 from dataclasses import dataclass
 
 import pandas as pd
 
+from .logging_utils import configure_logging, log_exception, log_info
 from .sudoeste import (
     _classify_title,
     _converter_data,
@@ -13,6 +15,9 @@ from .sudoeste import (
     _normalize_parcela,
     _require_column,
 )
+
+configure_logging()
+logger = logging.getLogger(__name__)
 
 OUTPUT_COLUMNS_DIRETO = [
     "AG",
@@ -276,8 +281,16 @@ def _processar_sudoeste_direto_frames(
     processada_excel: bytes,
     direta_excel: bytes,
 ) -> pd.DataFrame:
-    processada = _ler_tabela_upload(processada_excel)
-    direta = _ler_tabela_upload(direta_excel)
+    log_info(logger, "Iniciando processamento de frames", fluxo="sudoeste-direto")
+    processada = _ler_tabela_upload(processada_excel, contexto="sudoeste-direto/processada")
+    direta = _ler_tabela_upload(direta_excel, contexto="sudoeste-direto/direta")
+    log_info(
+        logger,
+        "Leitura das planilhas concluida",
+        fluxo="sudoeste-direto",
+        linhas_processada=len(processada),
+        linhas_direta=len(direta),
+    )
 
     if processada.empty:
         raise ValueError("A planilha processada esta vazia.")
@@ -286,6 +299,24 @@ def _processar_sudoeste_direto_frames(
 
     cols_processada = _preparar_colunas_processada(processada)
     cols_direta = _preparar_colunas_direta(direta)
+    log_info(
+        logger,
+        "Validacao de colunas obrigatorias concluida",
+        fluxo="sudoeste-direto",
+        colunas_processada={
+            "associado": cols_processada.associado,
+            "cpf": cols_processada.cpf,
+            "titulo": cols_processada.titulo,
+            "parcela": cols_processada.parcela,
+            "valor_titulo": cols_processada.valor_titulo,
+        },
+        colunas_direta={
+            "cpf": cols_direta.cpf,
+            "produto": cols_direta.produto,
+            "dt_acionamento": cols_direta.dt_acionamento,
+            "vencimento": cols_direta.vencimento,
+        },
+    )
 
     processada = processada.copy()
     direta = direta.copy()
@@ -299,13 +330,22 @@ def _processar_sudoeste_direto_frames(
     direta_lookup = _selecionar_linha_direta_por_cpf(direta)
 
     linhas_saida: list[dict[str, object]] = []
+    grupos_total = 0
+    grupos_sem_cpf = 0
+    grupos_sem_match = 0
+    grupos_com_match = 0
 
+    log_info(logger, "Iniciando match por CPF/CNPJ", fluxo="sudoeste-direto")
     for cpf, grupo in processada.groupby("_cpf_norm", sort=False):
+        grupos_total += 1
         if not cpf:
+            grupos_sem_cpf += 1
             continue
         linha_direta = direta_lookup.get(cpf)
         if linha_direta is None:
+            grupos_sem_match += 1
             continue
+        grupos_com_match += 1
 
         grupo_ordenado = grupo.sort_values("_ordem")
         primeira_linha = grupo_ordenado.iloc[0]
@@ -356,7 +396,18 @@ def _processar_sudoeste_direto_frames(
             }
         )
 
-    return pd.DataFrame(linhas_saida, columns=OUTPUT_COLUMNS_DIRETO)
+    saida = pd.DataFrame(linhas_saida, columns=OUTPUT_COLUMNS_DIRETO)
+    log_info(
+        logger,
+        "Processamento de frames concluido",
+        fluxo="sudoeste-direto",
+        grupos_total=grupos_total,
+        grupos_com_match=grupos_com_match,
+        grupos_sem_match=grupos_sem_match,
+        grupos_sem_cpf=grupos_sem_cpf,
+        linhas_saida=len(saida),
+    )
+    return saida
 
 
 def processar_sudoeste_direto_frames(
@@ -367,10 +418,23 @@ def processar_sudoeste_direto_frames(
 
 
 def _exportar_sudoeste_direto(dataframe: pd.DataFrame) -> io.BytesIO:
+    log_info(
+        logger,
+        "Iniciando exportacao de Excel",
+        fluxo="sudoeste-direto",
+        linhas=len(dataframe),
+        sheet_name="Sudoeste Direto",
+    )
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         dataframe.to_excel(writer, sheet_name="Sudoeste Direto", index=False)
     output.seek(0)
+    log_info(
+        logger,
+        "Exportacao de Excel concluida",
+        fluxo="sudoeste-direto",
+        tamanho_bytes=len(output.getbuffer()),
+    )
     return output
 
 
@@ -378,5 +442,10 @@ def processar_sudoeste_direto(
     processada_excel: bytes,
     direta_excel: bytes,
 ) -> io.BytesIO:
-    output_df = processar_sudoeste_direto_frames(processada_excel, direta_excel)
-    return _exportar_sudoeste_direto(output_df)
+    log_info(logger, "Iniciando fluxo sudoeste-direto")
+    try:
+        output_df = processar_sudoeste_direto_frames(processada_excel, direta_excel)
+        return _exportar_sudoeste_direto(output_df)
+    except Exception:
+        log_exception(logger, "Erro no fluxo sudoeste-direto")
+        raise

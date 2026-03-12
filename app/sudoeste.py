@@ -8,8 +8,10 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from .logging_utils import configure_logging, log_exception, log_info
+
+configure_logging()
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
 
 OUTPUT_COLUMNS = [
     "AG",
@@ -224,20 +226,59 @@ def _require_column(df: pd.DataFrame, *aliases: str) -> str:
     return column
 
 
-def _ler_tabela_upload(arquivo: bytes) -> pd.DataFrame:
+def _ler_tabela_upload(arquivo: bytes, *, contexto: str = "upload") -> pd.DataFrame:
+    log_info(
+        logger,
+        "Iniciando leitura de planilha",
+        contexto=contexto,
+        tamanho_bytes=len(arquivo),
+    )
     assinatura = arquivo[:4]
     if assinatura.startswith(b"PK") or assinatura == b"\xd0\xcf\x11\xe0":
-        return pd.read_excel(io.BytesIO(arquivo))
+        dataframe = pd.read_excel(io.BytesIO(arquivo))
+        log_info(
+            logger,
+            "Leitura de planilha concluida",
+            contexto=contexto,
+            formato="xlsx",
+            linhas=len(dataframe),
+            colunas=len(dataframe.columns),
+        )
+        return dataframe
 
     for encoding in ("utf-8-sig", "latin1"):
         try:
-            return pd.read_csv(io.BytesIO(arquivo), sep=";", encoding=encoding)
+            dataframe = pd.read_csv(io.BytesIO(arquivo), sep=";", encoding=encoding)
+            log_info(
+                logger,
+                "Leitura de planilha concluida",
+                contexto=contexto,
+                formato="csv",
+                encoding=encoding,
+                linhas=len(dataframe),
+                colunas=len(dataframe.columns),
+            )
+            return dataframe
         except Exception:  # pragma: no cover
             continue
 
     try:
-        return pd.read_excel(io.BytesIO(arquivo))
+        dataframe = pd.read_excel(io.BytesIO(arquivo))
+        log_info(
+            logger,
+            "Leitura de planilha concluida",
+            contexto=contexto,
+            formato="xlsx-fallback",
+            linhas=len(dataframe),
+            colunas=len(dataframe.columns),
+        )
+        return dataframe
     except Exception as exc:
+        log_exception(
+            logger,
+            "Falha ao interpretar arquivo de upload",
+            contexto=contexto,
+        )
         raise ValueError("Arquivo enviado nao esta em um formato CSV/XLSX valido.") from exc
 
 
@@ -355,7 +396,21 @@ def _prepare_base(df_base: pd.DataFrame) -> pd.DataFrame:
         "_parcela_norm",
         "_associado_norm",
     ]
-    return base.drop_duplicates(subset=dedupe_columns).reset_index(drop=True)
+    base_preparada = base.drop_duplicates(subset=dedupe_columns).reset_index(drop=True)
+    log_info(
+        logger,
+        "Base preparada e validada",
+        fluxo="sudoeste-inicial",
+        linhas_entrada=len(df_base),
+        linhas_pos_deduplicacao=len(base_preparada),
+        colunas_obrigatorias={
+            "associado": associado_col,
+            "cpf": cpf_col,
+            "contrato": contrato_col,
+            "parcela": parcela_col,
+        },
+    )
+    return base_preparada
 
 
 def _prepare_recebimento(df_recebimento: pd.DataFrame) -> tuple[pd.DataFrame, RecebimentoStats]:
@@ -410,7 +465,25 @@ def _prepare_recebimento(df_recebimento: pd.DataFrame) -> tuple[pd.DataFrame, Re
         total_consideradas=total_consideradas,
         total_ignoradas_historico=total_ignoradas_historico,
     )
-    return recebimento.reset_index(drop=True), stats
+    recebimento_preparado = recebimento.reset_index(drop=True)
+    log_info(
+        logger,
+        "Recebimento preparado e validado",
+        fluxo="sudoeste-inicial",
+        linhas_entrada=total_entrada,
+        linhas_consideradas=total_consideradas,
+        linhas_ignoradas_historico=total_ignoradas_historico,
+        colunas_obrigatorias={
+            "associado": associado_col,
+            "titulo": titulo_col,
+            "parcela": parcela_col,
+            "valor_titulo": valor_col,
+            "historico": historico_col,
+            "data": data_col,
+        },
+        coluna_cpf=cpf_col,
+    )
+    return recebimento_preparado, stats
 
 
 def _prepare_denodo(df_denodo: pd.DataFrame) -> pd.DataFrame:
@@ -427,6 +500,17 @@ def _prepare_denodo(df_denodo: pd.DataFrame) -> pd.DataFrame:
     denodo["_title_class"] = denodo[solucao_col].apply(_classify_title)
     denodo["_title_kind"] = denodo["_title_class"].map(lambda item: item.kind)
     denodo["_title_key"] = denodo["_title_class"].map(lambda item: item.key)
+    log_info(
+        logger,
+        "Denodo preparado e validado",
+        fluxo="sudoeste-inicial",
+        linhas=len(denodo),
+        colunas_obrigatorias={
+            "protocolo": protocolo_col,
+            "cpf": cpf_col,
+            "solucao_associada": solucao_col,
+        },
+    )
     return denodo
 
 
@@ -784,19 +868,46 @@ def _gerar_resumo_execucao(
 
 
 def _exportar_excel(dataframe: pd.DataFrame, sheet_name: str) -> io.BytesIO:
+    log_info(
+        logger,
+        "Iniciando exportacao de Excel",
+        fluxo="sudoeste-inicial",
+        sheet_name=sheet_name,
+        linhas=len(dataframe),
+    )
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         dataframe.to_excel(writer, sheet_name=sheet_name, index=False)
     output.seek(0)
+    log_info(
+        logger,
+        "Exportacao de Excel concluida",
+        fluxo="sudoeste-inicial",
+        sheet_name=sheet_name,
+        tamanho_bytes=len(output.getbuffer()),
+    )
     return output
 
 
 def _exportar_diagnostico_com_resumo(diagnostico_df: pd.DataFrame, resumo_df: pd.DataFrame) -> io.BytesIO:
+    log_info(
+        logger,
+        "Iniciando exportacao de diagnostico com resumo",
+        fluxo="sudoeste-inicial",
+        linhas_diagnostico=len(diagnostico_df),
+        linhas_resumo=len(resumo_df),
+    )
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         resumo_df.to_excel(writer, sheet_name="Resumo", index=False)
         diagnostico_df.to_excel(writer, sheet_name="Diagnostico", index=False)
     output.seek(0)
+    log_info(
+        logger,
+        "Exportacao de diagnostico com resumo concluida",
+        fluxo="sudoeste-inicial",
+        tamanho_bytes=len(output.getbuffer()),
+    )
     return output
 
 
@@ -805,30 +916,64 @@ def _processar_sudoeste_frames(
     recebimento_excel: bytes,
     denodo_excel: bytes,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    df_base = _ler_tabela_upload(base_excel)
-    df_recebimento = _ler_tabela_upload(recebimento_excel)
-    df_denodo = _ler_tabela_upload(denodo_excel)
+    log_info(logger, "Iniciando processamento de frames", fluxo="sudoeste-inicial")
+    try:
+        df_base = _ler_tabela_upload(base_excel, contexto="sudoeste-inicial/base")
+        df_recebimento = _ler_tabela_upload(recebimento_excel, contexto="sudoeste-inicial/recebimento")
+        df_denodo = _ler_tabela_upload(denodo_excel, contexto="sudoeste-inicial/denodo")
 
-    base = _prepare_base(df_base)
-    recebimento, recebimento_stats = _prepare_recebimento(df_recebimento)
-    denodo = _prepare_denodo(df_denodo)
+        log_info(
+            logger,
+            "Leitura das planilhas concluida",
+            fluxo="sudoeste-inicial",
+            linhas_base=len(df_base),
+            linhas_recebimento=len(df_recebimento),
+            linhas_denodo=len(df_denodo),
+        )
 
-    base_indexes = _build_base_indexes(base)
-    denodo_lookup = _build_denodo_lookup(denodo)
+        base = _prepare_base(df_base)
+        recebimento, recebimento_stats = _prepare_recebimento(df_recebimento)
+        denodo = _prepare_denodo(df_denodo)
 
-    output_rows = []
-    diagnostic_rows = []
+        base_indexes = _build_base_indexes(base)
+        denodo_lookup = _build_denodo_lookup(denodo)
 
-    for _, recebimento_row in recebimento.sort_values("_ordem").iterrows():
-        base_decision = _find_best_base_match(recebimento_row, base, base_indexes)
-        denodo_decision = _find_denodo_match(recebimento_row, base_decision, denodo_lookup)
-        output_rows.append(_build_output_row(recebimento_row, base_decision, denodo_decision))
-        diagnostic_rows.append(_build_diagnostic_row(recebimento_row, base_decision, denodo_decision))
+        output_rows = []
+        diagnostic_rows = []
 
-    output_df = pd.DataFrame(output_rows, columns=OUTPUT_COLUMNS)
-    diagnostic_df = pd.DataFrame(diagnostic_rows, columns=DIAGNOSTIC_COLUMNS)
-    resumo_df = _gerar_resumo_execucao(diagnostic_df, recebimento_stats)
-    return output_df, diagnostic_df, resumo_df
+        log_info(
+            logger,
+            "Iniciando etapa de match",
+            fluxo="sudoeste-inicial",
+            linhas_recebimento_consideradas=len(recebimento),
+        )
+        for _, recebimento_row in recebimento.sort_values("_ordem").iterrows():
+            base_decision = _find_best_base_match(recebimento_row, base, base_indexes)
+            denodo_decision = _find_denodo_match(recebimento_row, base_decision, denodo_lookup)
+            output_rows.append(_build_output_row(recebimento_row, base_decision, denodo_decision))
+            diagnostic_rows.append(_build_diagnostic_row(recebimento_row, base_decision, denodo_decision))
+
+        output_df = pd.DataFrame(output_rows, columns=OUTPUT_COLUMNS)
+        diagnostic_df = pd.DataFrame(diagnostic_rows, columns=DIAGNOSTIC_COLUMNS)
+        resumo_df = _gerar_resumo_execucao(diagnostic_df, recebimento_stats)
+
+        log_info(
+            logger,
+            "Processamento de frames concluido",
+            fluxo="sudoeste-inicial",
+            linhas_saida=len(output_df),
+            linhas_diagnostico=len(diagnostic_df),
+            base_match_confirmado=int((diagnostic_df["Status Base"] == BASE_STATUS_CONFIRMED).sum()),
+            base_match_ausente=int((diagnostic_df["Status Base"] == BASE_STATUS_MISSING).sum()),
+            base_match_ambiguo=int((diagnostic_df["Status Base"] == BASE_STATUS_AMBIGUOUS).sum()),
+            denodo_match_confirmado=int((diagnostic_df["Status Denodo"] == DENODO_STATUS_CONFIRMED).sum()),
+            denodo_match_ausente=int((diagnostic_df["Status Denodo"] == DENODO_STATUS_MISSING).sum()),
+            denodo_match_ambiguo=int((diagnostic_df["Status Denodo"] == DENODO_STATUS_AMBIGUOUS).sum()),
+        )
+        return output_df, diagnostic_df, resumo_df
+    except Exception:
+        log_exception(logger, "Falha durante processamento de frames", fluxo="sudoeste-inicial")
+        raise
 
 
 def processar_sudoeste(
@@ -836,9 +981,13 @@ def processar_sudoeste(
     recebimento_excel: bytes,
     denodo_excel: bytes,
 ) -> io.BytesIO:
-    logger.info("=" * 10)
-    output_df, _, _ = _processar_sudoeste_frames(base_excel, recebimento_excel, denodo_excel)
-    return _exportar_excel(output_df, "Sudoeste Inicial")
+    log_info(logger, "Iniciando fluxo sudoeste-inicial")
+    try:
+        output_df, _, _ = _processar_sudoeste_frames(base_excel, recebimento_excel, denodo_excel)
+        return _exportar_excel(output_df, "Sudoeste Inicial")
+    except Exception:
+        log_exception(logger, "Erro no fluxo sudoeste-inicial")
+        raise
 
 
 def diagnosticar_sudoeste(
@@ -846,8 +995,13 @@ def diagnosticar_sudoeste(
     recebimento_excel: bytes,
     denodo_excel: bytes,
 ) -> pd.DataFrame:
-    _, diagnostic_df, _ = _processar_sudoeste_frames(base_excel, recebimento_excel, denodo_excel)
-    return diagnostic_df
+    log_info(logger, "Iniciando geracao de diagnostico sudoeste-inicial")
+    try:
+        _, diagnostic_df, _ = _processar_sudoeste_frames(base_excel, recebimento_excel, denodo_excel)
+        return diagnostic_df
+    except Exception:
+        log_exception(logger, "Erro ao gerar diagnostico sudoeste-inicial")
+        raise
 
 
 def resumir_execucao_sudoeste(
@@ -855,8 +1009,13 @@ def resumir_execucao_sudoeste(
     recebimento_excel: bytes,
     denodo_excel: bytes,
 ) -> pd.DataFrame:
-    _, _, resumo_df = _processar_sudoeste_frames(base_excel, recebimento_excel, denodo_excel)
-    return resumo_df
+    log_info(logger, "Iniciando geracao de resumo sudoeste-inicial")
+    try:
+        _, _, resumo_df = _processar_sudoeste_frames(base_excel, recebimento_excel, denodo_excel)
+        return resumo_df
+    except Exception:
+        log_exception(logger, "Erro ao gerar resumo sudoeste-inicial")
+        raise
 
 
 def processar_sudoeste_com_diagnostico(
@@ -864,8 +1023,13 @@ def processar_sudoeste_com_diagnostico(
     recebimento_excel: bytes,
     denodo_excel: bytes,
 ) -> tuple[io.BytesIO, pd.DataFrame]:
-    output_df, diagnostic_df, _ = _processar_sudoeste_frames(base_excel, recebimento_excel, denodo_excel)
-    return _exportar_excel(output_df, "Sudoeste Inicial"), diagnostic_df
+    log_info(logger, "Iniciando fluxo sudoeste-inicial com diagnostico")
+    try:
+        output_df, diagnostic_df, _ = _processar_sudoeste_frames(base_excel, recebimento_excel, denodo_excel)
+        return _exportar_excel(output_df, "Sudoeste Inicial"), diagnostic_df
+    except Exception:
+        log_exception(logger, "Erro no fluxo sudoeste-inicial com diagnostico")
+        raise
 
 
 def processar_sudoeste_com_diagnostico_e_resumo(
@@ -873,8 +1037,13 @@ def processar_sudoeste_com_diagnostico_e_resumo(
     recebimento_excel: bytes,
     denodo_excel: bytes,
 ) -> tuple[io.BytesIO, pd.DataFrame, pd.DataFrame]:
-    output_df, diagnostic_df, resumo_df = _processar_sudoeste_frames(base_excel, recebimento_excel, denodo_excel)
-    return _exportar_excel(output_df, "Sudoeste Inicial"), diagnostic_df, resumo_df
+    log_info(logger, "Iniciando fluxo sudoeste-inicial com diagnostico e resumo")
+    try:
+        output_df, diagnostic_df, resumo_df = _processar_sudoeste_frames(base_excel, recebimento_excel, denodo_excel)
+        return _exportar_excel(output_df, "Sudoeste Inicial"), diagnostic_df, resumo_df
+    except Exception:
+        log_exception(logger, "Erro no fluxo sudoeste-inicial com diagnostico e resumo")
+        raise
 
 
 def exportar_diagnostico_sudoeste(
@@ -882,5 +1051,10 @@ def exportar_diagnostico_sudoeste(
     recebimento_excel: bytes,
     denodo_excel: bytes,
 ) -> io.BytesIO:
-    _, diagnostic_df, resumo_df = _processar_sudoeste_frames(base_excel, recebimento_excel, denodo_excel)
-    return _exportar_diagnostico_com_resumo(diagnostic_df, resumo_df)
+    log_info(logger, "Iniciando exportacao de diagnostico sudoeste-inicial")
+    try:
+        _, diagnostic_df, resumo_df = _processar_sudoeste_frames(base_excel, recebimento_excel, denodo_excel)
+        return _exportar_diagnostico_com_resumo(diagnostic_df, resumo_df)
+    except Exception:
+        log_exception(logger, "Erro ao exportar diagnostico sudoeste-inicial")
+        raise

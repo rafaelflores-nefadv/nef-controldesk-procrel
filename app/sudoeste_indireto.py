@@ -1,10 +1,12 @@
 import io
+import logging
 import re
 from collections import OrderedDict
 from dataclasses import dataclass
 
 import pandas as pd
 
+from .logging_utils import configure_logging, log_exception, log_info
 from .sudoeste import (
     _classify_title,
     _converter_data,
@@ -14,6 +16,9 @@ from .sudoeste import (
     _normalize_parcela,
     _require_column,
 )
+
+configure_logging()
+logger = logging.getLogger(__name__)
 
 OUTPUT_COLUMNS_INDIRETO = [
     "AG",
@@ -314,8 +319,16 @@ def _processar_sudoeste_indireto_frames(
     processada_excel: bytes,
     indireto_excel: bytes,
 ) -> pd.DataFrame:
-    processada = _ler_tabela_upload(processada_excel)
-    indireto = _ler_tabela_upload(indireto_excel)
+    log_info(logger, "Iniciando processamento de frames", fluxo="sudoeste-indireto")
+    processada = _ler_tabela_upload(processada_excel, contexto="sudoeste-indireto/processada")
+    indireto = _ler_tabela_upload(indireto_excel, contexto="sudoeste-indireto/indireto")
+    log_info(
+        logger,
+        "Leitura das planilhas concluida",
+        fluxo="sudoeste-indireto",
+        linhas_processada=len(processada),
+        linhas_indireto=len(indireto),
+    )
 
     if processada.empty:
         raise ValueError("A planilha processada esta vazia.")
@@ -324,6 +337,24 @@ def _processar_sudoeste_indireto_frames(
 
     cols_processada = _preparar_colunas_processada(processada)
     cols_indireto = _preparar_colunas_indireto(indireto)
+    log_info(
+        logger,
+        "Validacao de colunas obrigatorias concluida",
+        fluxo="sudoeste-indireto",
+        colunas_processada={
+            "associado": cols_processada.associado,
+            "cpf": cols_processada.cpf,
+            "titulo": cols_processada.titulo,
+            "parcela": cols_processada.parcela,
+            "valor_titulo": cols_processada.valor_titulo,
+        },
+        colunas_indireto={
+            "ultimo_acionamento": cols_indireto.ultimo_acionamento,
+            "cpf": cols_indireto.cpf,
+            "produto_legado": cols_indireto.produto_legado,
+            "vencimento_mais_antigo": cols_indireto.vencimento_mais_antigo,
+        },
+    )
 
     processada = processada.copy()
     indireto = indireto.copy()
@@ -337,13 +368,22 @@ def _processar_sudoeste_indireto_frames(
     indireto_lookup = _selecionar_linha_indireto_por_cpf(indireto)
 
     linhas_saida: list[dict[str, object]] = []
+    grupos_total = 0
+    grupos_sem_cpf = 0
+    grupos_sem_match = 0
+    grupos_com_match = 0
 
+    log_info(logger, "Iniciando match por CPF/CNPJ", fluxo="sudoeste-indireto")
     for cpf, grupo in processada.groupby("_cpf_norm", sort=False):
+        grupos_total += 1
         if not cpf:
+            grupos_sem_cpf += 1
             continue
         linha_indireto = indireto_lookup.get(cpf)
         if linha_indireto is None:
+            grupos_sem_match += 1
             continue
+        grupos_com_match += 1
 
         grupo_ordenado = grupo.sort_values("_ordem")
         primeira_linha = grupo_ordenado.iloc[0]
@@ -384,7 +424,18 @@ def _processar_sudoeste_indireto_frames(
             }
         )
 
-    return pd.DataFrame(linhas_saida, columns=OUTPUT_COLUMNS_INDIRETO)
+    saida = pd.DataFrame(linhas_saida, columns=OUTPUT_COLUMNS_INDIRETO)
+    log_info(
+        logger,
+        "Processamento de frames concluido",
+        fluxo="sudoeste-indireto",
+        grupos_total=grupos_total,
+        grupos_com_match=grupos_com_match,
+        grupos_sem_match=grupos_sem_match,
+        grupos_sem_cpf=grupos_sem_cpf,
+        linhas_saida=len(saida),
+    )
+    return saida
 
 
 def processar_sudoeste_indireto_frames(
@@ -395,10 +446,23 @@ def processar_sudoeste_indireto_frames(
 
 
 def _exportar_sudoeste_indireto(dataframe: pd.DataFrame) -> io.BytesIO:
+    log_info(
+        logger,
+        "Iniciando exportacao de Excel",
+        fluxo="sudoeste-indireto",
+        linhas=len(dataframe),
+        sheet_name="Sudoeste Indireto",
+    )
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         dataframe.to_excel(writer, sheet_name="Sudoeste Indireto", index=False)
     output.seek(0)
+    log_info(
+        logger,
+        "Exportacao de Excel concluida",
+        fluxo="sudoeste-indireto",
+        tamanho_bytes=len(output.getbuffer()),
+    )
     return output
 
 
@@ -406,5 +470,10 @@ def processar_sudoeste_indireto(
     processada_excel: bytes,
     indireto_excel: bytes,
 ) -> io.BytesIO:
-    output_df = processar_sudoeste_indireto_frames(processada_excel, indireto_excel)
-    return _exportar_sudoeste_indireto(output_df)
+    log_info(logger, "Iniciando fluxo sudoeste-indireto")
+    try:
+        output_df = processar_sudoeste_indireto_frames(processada_excel, indireto_excel)
+        return _exportar_sudoeste_indireto(output_df)
+    except Exception:
+        log_exception(logger, "Erro no fluxo sudoeste-indireto")
+        raise
