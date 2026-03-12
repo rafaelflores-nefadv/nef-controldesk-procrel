@@ -100,6 +100,35 @@ const FORM_CONFIG = {
             { delayMs: 2600, progress: 78, status: "Consolidando por CPF/CNPJ...", detail: "Aplicando match e consolidacao do fluxo indireto." },
             { delayMs: 4200, progress: 92, status: "Gerando arquivo final...", detail: "Montando o relatorio sudoeste indireto." }
         ]
+    },
+    sudoeste_consolidado: {
+        endpoint: "/sudoeste-consolidado",
+        filename: "sudoeste_consolidado_processado.xlsx",
+        requiredCount: 3,
+        fields: [
+            {
+                name: "processada",
+                label: "Planilha Processada",
+                hint: "Planilha gerada no fluxo Sudoeste - inicial."
+            },
+            {
+                name: "direta",
+                label: "Planilha Direta",
+                hint: "Planilha usada no fluxo Sudoeste - direto."
+            },
+            {
+                name: "indireto",
+                label: "Planilha Indireto",
+                hint: "Planilha usada no fluxo Sudoeste - indireto."
+            }
+        ],
+        progressSteps: [
+            { delayMs: 0, progress: 10, status: "Validando arquivos...", detail: "Conferindo as tres planilhas obrigatorias." },
+            { delayMs: 350, progress: 25, status: "Enviando arquivos...", detail: "Transferindo os arquivos para o servidor." },
+            { delayMs: 1200, progress: 55, status: "Processando direto e indireto...", detail: "Executando os fluxos existentes sem alterar regras." },
+            { delayMs: 2600, progress: 80, status: "Montando arquivo consolidado...", detail: "Criando as abas Direto e Indireto no mesmo Excel." },
+            { delayMs: 4200, progress: 92, status: "Gerando arquivo final...", detail: "Preparando o relatorio consolidado para download." }
+        ]
     }
 };
 

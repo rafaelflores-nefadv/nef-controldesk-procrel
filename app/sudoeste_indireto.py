@@ -387,6 +387,13 @@ def _processar_sudoeste_indireto_frames(
     return pd.DataFrame(linhas_saida, columns=OUTPUT_COLUMNS_INDIRETO)
 
 
+def processar_sudoeste_indireto_frames(
+    processada_excel: bytes,
+    indireto_excel: bytes,
+) -> pd.DataFrame:
+    return _processar_sudoeste_indireto_frames(processada_excel, indireto_excel)
+
+
 def _exportar_sudoeste_indireto(dataframe: pd.DataFrame) -> io.BytesIO:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -399,5 +406,5 @@ def processar_sudoeste_indireto(
     processada_excel: bytes,
     indireto_excel: bytes,
 ) -> io.BytesIO:
-    output_df = _processar_sudoeste_indireto_frames(processada_excel, indireto_excel)
+    output_df = processar_sudoeste_indireto_frames(processada_excel, indireto_excel)
     return _exportar_sudoeste_indireto(output_df)
