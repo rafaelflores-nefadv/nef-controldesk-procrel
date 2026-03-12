@@ -324,14 +324,50 @@ function getFilenameFromDisposition(contentDisposition, fallbackName) {
     return fallbackName;
 }
 
+function formatValidationDetail(detail) {
+    if (!detail || typeof detail !== "object") {
+        return "";
+    }
+
+    const location = Array.isArray(detail.loc)
+        ? detail.loc.filter((part) => part !== "body").join(".")
+        : "";
+    const rawMessage = typeof detail.msg === "string" ? detail.msg.trim() : "";
+    const message = rawMessage === "Field required" ? "campo obrigatorio" : rawMessage;
+
+    if (!message) {
+        return "";
+    }
+
+    return location ? `${location}: ${message}` : message;
+}
+
 async function extractErrorMessage(response) {
     try {
         const data = await response.json();
+
+        if (Array.isArray(data?.detail) && data.detail.length > 0) {
+            const details = data.detail
+                .map((detail) => formatValidationDetail(detail))
+                .filter(Boolean);
+
+            if (details.length > 0) {
+                return details.join(" | ");
+            }
+        }
+
         if (typeof data?.detail === "string" && data.detail.trim()) {
             return data.detail;
         }
     } catch (error) {
-        return `Falha no envio: ${response.status} ${response.statusText}`.trim();
+        try {
+            const text = await response.text();
+            if (text?.trim()) {
+                return text.trim();
+            }
+        } catch (readError) {
+            return `Falha no envio: ${response.status} ${response.statusText}`.trim();
+        }
     }
 
     return `Falha no envio: ${response.status} ${response.statusText}`.trim();
