@@ -91,6 +91,7 @@ async def _executar_fluxo_upload(
     processor: Callable[..., object],
     output_filename: str,
     multipart_keys: list[str] | None = None,
+    processor_param_map: dict[str, str] | None = None,
 ) -> StreamingResponse:
     request_id = uuid.uuid4().hex
     context_token = bind_log_context(request_id=request_id, fluxo=fluxo)
@@ -145,9 +146,33 @@ async def _executar_fluxo_upload(
                 for field_name, upload in uploads.items()
                 if upload is not None
             }
+            param_map = processor_param_map or {field_name: field_name for field_name in payload.keys()}
+            missing_map_fields = sorted({source_field for source_field in param_map.values() if source_field not in payload})
+            if missing_map_fields:
+                log_warning(
+                    logger,
+                    "Mapeamento de parametros do processador incompleto",
+                    campos_mapeados_ausentes=missing_map_fields,
+                    mapeamento=param_map,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Erro interno ao processar fluxo {fluxo}. request_id={request_id}",
+                )
+
+            processor_kwargs = {
+                processor_param: payload[source_field]
+                for processor_param, source_field in param_map.items()
+            }
+
+            log_info(
+                logger,
+                "Mapeamento de parametros para o processador",
+                mapeamento=param_map,
+            )
             log_info(logger, "Iniciando processamento do fluxo")
 
-            resultado = processor(**payload)
+            resultado = processor(**processor_kwargs)
             output_size = len(resultado.getbuffer()) if hasattr(resultado, "getbuffer") else None
 
             log_info(
@@ -193,6 +218,10 @@ async def planalto(
         processor=processar_planalto,
         output_filename="planalto_processado.xlsx",
         multipart_keys=multipart_keys,
+        processor_param_map={
+            "recebimento": "recebimento",
+            "pagamento": "pagamento",
+        },
     )
 
 
@@ -210,6 +239,11 @@ async def sudoeste(
         processor=processar_sudoeste,
         output_filename="sudoeste_inicial_processado.xlsx",
         multipart_keys=multipart_keys,
+        processor_param_map={
+            "base_excel": "base",
+            "recebimento_excel": "recebimento",
+            "denodo_excel": "denodo",
+        },
     )
 
 
@@ -226,6 +260,10 @@ async def sudoeste_direto(
         processor=processar_sudoeste_direto,
         output_filename="sudoeste_direto_processado.xlsx",
         multipart_keys=multipart_keys,
+        processor_param_map={
+            "processada_excel": "processada",
+            "direta_excel": "direta",
+        },
     )
 
 
@@ -242,6 +280,10 @@ async def sudoeste_indireto(
         processor=processar_sudoeste_indireto,
         output_filename="sudoeste_indireto_processado.xlsx",
         multipart_keys=multipart_keys,
+        processor_param_map={
+            "processada_excel": "processada",
+            "indireto_excel": "indireto",
+        },
     )
 
 
@@ -259,4 +301,9 @@ async def sudoeste_consolidado(
         processor=processar_sudoeste_consolidado,
         output_filename="sudoeste_consolidado_processado.xlsx",
         multipart_keys=multipart_keys,
+        processor_param_map={
+            "processada_excel": "processada",
+            "direta_excel": "direta",
+            "indireto_excel": "indireto",
+        },
     )
