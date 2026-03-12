@@ -5,6 +5,8 @@ from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from .planalto import processar_planalto
 from .sudoeste import processar_sudoeste
+from .sudoeste_direto import processar_sudoeste_direto
+from .sudoeste_indireto import processar_sudoeste_indireto
 
 app = FastAPI()
 
@@ -51,27 +53,64 @@ async def planalto(
 @app.post("/sudoeste")
 async def sudoeste(
     base: UploadFile = File(...),
-    pagamentos: UploadFile = File(...),
-    relatorio: UploadFile = File(...),
+    recebimento: UploadFile = File(...),
     denodo: UploadFile = File(...)
 ):
     try:
         base_bytes = await base.read()
-        pagamentos_bytes = await pagamentos.read()
-        relatorio_bytes = await relatorio.read()
+        recebimento_bytes = await recebimento.read()
         denodo_bytes = await denodo.read()
 
         resultado = processar_sudoeste(
             base_bytes,
-            pagamentos_bytes,
-            relatorio_bytes,
+            recebimento_bytes,
             denodo_bytes
         )
 
         return StreamingResponse(
             resultado,
             media_type=EXCEL_MEDIA_TYPE,
-            headers={"Content-Disposition": "attachment; filename=sudoeste_processado.xlsx"}
+            headers={"Content-Disposition": "attachment; filename=sudoeste_inicial_processado.xlsx"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao processar arquivo: {str(e)}")
+
+
+@app.post("/sudoeste-direto")
+async def sudoeste_direto(
+    processada: UploadFile = File(...),
+    direta: UploadFile = File(...)
+):
+    try:
+        processada_bytes = await processada.read()
+        direta_bytes = await direta.read()
+
+        resultado = processar_sudoeste_direto(processada_bytes, direta_bytes)
+
+        return StreamingResponse(
+            resultado,
+            media_type=EXCEL_MEDIA_TYPE,
+            headers={"Content-Disposition": "attachment; filename=sudoeste_direto_processado.xlsx"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao processar arquivo: {str(e)}")
+
+
+@app.post("/sudoeste-indireto")
+async def sudoeste_indireto(
+    processada: UploadFile = File(...),
+    indireto: UploadFile = File(...)
+):
+    try:
+        processada_bytes = await processada.read()
+        indireto_bytes = await indireto.read()
+
+        resultado = processar_sudoeste_indireto(processada_bytes, indireto_bytes)
+
+        return StreamingResponse(
+            resultado,
+            media_type=EXCEL_MEDIA_TYPE,
+            headers={"Content-Disposition": "attachment; filename=sudoeste_indireto_processado.xlsx"}
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao processar arquivo: {str(e)}")

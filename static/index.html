@@ -3,16 +3,16 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Relatórios Excel</title>
+    <title>Relatorios Excel</title>
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
     <main class="page">
         <section class="panel">
             <p class="eyebrow">FastAPI + Excel</p>
-            <h1>Processamento de relatórios</h1>
+            <h1>Processamento de relatorios</h1>
             <p class="intro">
-                Envie os arquivos do tipo selecionado e o relatório processado será baixado automaticamente.
+                Envie os arquivos do tipo selecionado e o relatorio processado sera baixado automaticamente.
             </p>
 
             <form id="upload-form" novalidate>
@@ -20,24 +20,45 @@
                     <label for="tipo">Tipo de processamento</label>
                     <select id="tipo" name="tipo">
                         <option value="planalto">Planalto</option>
-                        <option value="sudoeste">Sudoeste</option>
+                        <option value="sudoeste">Sudoeste - inicial</option>
+                        <option value="sudoeste_direto">Sudoeste - direto</option>
+                        <option value="sudoeste_indireto">Sudoeste - indireto</option>
                     </select>
                 </div>
 
                 <div class="requirements">
-                    <strong>Arquivos obrigatórios</strong>
+                    <strong>Arquivos obrigatorios</strong>
                     <p id="requirements-text"></p>
                 </div>
 
                 <div id="inputs-container" class="inputs-grid"></div>
 
-                <div id="message" class="message" aria-live="polite"></div>
+                <div id="message" class="message" aria-live="polite">
+                    <div class="progress-row" aria-hidden="true">
+                        <div class="progress-track">
+                            <div
+                                id="progress-bar"
+                                class="progress-bar"
+                                role="progressbar"
+                                aria-valuemin="0"
+                                aria-valuemax="100"
+                                aria-valuenow="0"
+                            ></div>
+                        </div>
+                    </div>
+                    <div class="status-header">
+                        <span id="status-chip" class="status-chip"></span>
+                    </div>
+                    <div id="status-text" class="status-text"></div>
+                    <div id="status-detail" class="status-detail"></div>
+                    <div id="status-file" class="status-file"></div>
+                </div>
 
                 <button id="submit-button" type="submit">Enviar arquivos</button>
             </form>
         </section>
     </main>
 
-    <script src="/static/app.js" defer></script>
+    <script src="/static/app.js?v=20260312-sudoeste-indireto" defer></script>
 </body>
 </html>

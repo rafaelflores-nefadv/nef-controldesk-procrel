@@ -2,6 +2,8 @@ import io
 import logging
 import re
 import unicodedata
+from collections import defaultdict
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -9,11 +11,193 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+OUTPUT_COLUMNS = [
+    "AG",
+    "Conta",
+    "Associado",
+    "CPF/CNPJ",
+    "Titulo",
+    "Parcela",
+    "Valor Título",
+    "Histórico",
+    "Data",
+    "Atraso",
+    "%receita",
+    "receita",
+    "Dt Ultimo Acionamento",
+    "Situação",
+    "Venc. Parcela",
+    "Protocolo",
+]
+
+DIAGNOSTIC_COLUMNS = [
+    "Linha Recebimento",
+    "Associado",
+    "CPF/CNPJ",
+    "Titulo",
+    "Parcela",
+    "Tipo Titulo Recebimento",
+    "Chave Normalizada Recebimento",
+    "CPF Normalizado",
+    "Parcela Normalizada",
+    "Associado Normalizado",
+    "Status Base",
+    "Detalhe Base",
+    "Linha Base",
+    "Chave Base Selecionada",
+    "Status Denodo",
+    "Detalhe Denodo",
+    "Chave Denodo Selecionada",
+    "Linhas Denodo",
+    "Protocolos Denodo",
+    "Protocolo Resultado",
+]
+
+SUMMARY_COLUMNS = ["Indicador", "Valor"]
+
+BASE_STATUS_CONFIRMED = "match base confirmado"
+BASE_STATUS_MISSING = "sem match na base"
+BASE_STATUS_AMBIGUOUS = "match ambiguo na base"
+DENODO_STATUS_CONFIRMED = "match denodo confirmado"
+DENODO_STATUS_MISSING = "sem match na denodo"
+DENODO_STATUS_AMBIGUOUS = "match denodo ambiguo"
+
+CARD_TITLES = {
+    "cartoesmaster",
+    "cartaovisaempresarial",
+    "atrasocartaovisa",
+}
+CHI_TITLES = {
+    "inadimplenciachequeespecial",
+    "inadimplenciajurosadiantamento",
+}
+CARD_ABBREVIATIONS = {"mas", "car"}
+CHI_ABBREVIATIONS = {"chi"}
+
+
+@dataclass(frozen=True)
+class TitleClassification:
+    kind: str
+    key: str
+
+
+@dataclass(frozen=True)
+class CandidatePool:
+    title_candidates: tuple[int, ...]
+    support_candidates: tuple[int, ...]
+    candidate_indexes: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class RecebimentoStats:
+    total_entrada: int
+    total_consideradas: int
+    total_ignoradas_historico: int
+
+
+@dataclass
+class BaseMatchDecision:
+    status: str
+    detail: str
+    matched_row: pd.Series | None = None
+    matched_index: int | None = None
+    matched_key: str | None = None
+    candidate_indexes: tuple[int, ...] = ()
+    scored_candidates: tuple[tuple[int, int], ...] = ()
+
+
+@dataclass
+class DenodoLookupEntry:
+    status: str
+    protocolo: str | None
+    protocolos: tuple[str, ...]
+    source_rows: tuple[int, ...]
+
+
+@dataclass
+class DenodoMatchDecision:
+    status: str
+    detail: str
+    protocolo: str | None = None
+    lookup_key: str | None = None
+    protocolos: tuple[str, ...] = ()
+    source_rows: tuple[int, ...] = ()
+
+
+def _strip_accents(value: object) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except TypeError:
+        pass
+
+    text = unicodedata.normalize("NFKD", str(value))
+    return text.encode("ascii", "ignore").decode("ascii")
+
 
 def _normalize_text(value: object) -> str:
-    text = unicodedata.normalize("NFKD", str(value or ""))
-    text = text.encode("ascii", "ignore").decode("ascii")
-    return re.sub(r"[^a-z0-9]+", "", text.lower())
+    text = _strip_accents(value).lower()
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def _normalize_cpf_cnpj(value: object) -> str:
+    return re.sub(r"\D+", "", _strip_accents(value))
+
+
+def _normalize_contract(value: object) -> str:
+    text = _strip_accents(value).upper()
+    return re.sub(r"[^A-Z0-9]+", "", text)
+
+
+def _normalize_parcela(value: object) -> str:
+    try:
+        if pd.isna(value):
+            return ""
+    except TypeError:
+        pass
+
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+
+    if isinstance(value, (float, np.floating)):
+        if float(value).is_integer():
+            return str(int(value))
+        return _normalize_text(value)
+
+    text = str(value).strip()
+    if not text:
+        return ""
+
+    if re.fullmatch(r"\d+(?:[.,]0+)?", text):
+        return str(int(float(text.replace(",", "."))))
+
+    return _normalize_text(text)
+
+
+def _is_contract_token(normalized_contract: str) -> bool:
+    if not normalized_contract:
+        return False
+    if normalized_contract in {"CHI", "MAS", "CAR"}:
+        return False
+    return any(char.isdigit() for char in normalized_contract)
+
+
+def _classify_title(value: object) -> TitleClassification:
+    raw_text = _normalize_text(value)
+    contract = _normalize_contract(value)
+
+    if raw_text in CARD_TITLES or raw_text in CARD_ABBREVIATIONS:
+        return TitleClassification(kind="card", key="cartao")
+
+    if raw_text in CHI_TITLES or raw_text in CHI_ABBREVIATIONS:
+        return TitleClassification(kind="chi", key="chi")
+
+    if _is_contract_token(contract):
+        return TitleClassification(kind="contract", key=contract)
+
+    return TitleClassification(kind="text", key=raw_text)
 
 
 def _find_column(df: pd.DataFrame, *aliases: str) -> str | None:
@@ -45,12 +229,11 @@ def _ler_tabela_upload(arquivo: bytes) -> pd.DataFrame:
     if assinatura.startswith(b"PK") or assinatura == b"\xd0\xcf\x11\xe0":
         return pd.read_excel(io.BytesIO(arquivo))
 
-    erros_csv = []
     for encoding in ("utf-8-sig", "latin1"):
         try:
             return pd.read_csv(io.BytesIO(arquivo), sep=";", encoding=encoding)
-        except Exception as exc:  # pragma: no cover - fallback defensivo
-            erros_csv.append(exc)
+        except Exception:  # pragma: no cover
+            continue
 
     try:
         return pd.read_excel(io.BytesIO(arquivo))
@@ -58,16 +241,12 @@ def _ler_tabela_upload(arquivo: bytes) -> pd.DataFrame:
         raise ValueError("Arquivo enviado nao esta em um formato CSV/XLSX valido.") from exc
 
 
-def _converter_cartao(valor: object) -> object:
-    valor_formatado = str(valor).strip().upper()
-    if valor_formatado.startswith("CAR") or valor_formatado.startswith("MAS"):
-        return "cartão"
-    return valor
-
-
 def _converter_data(valor: object):
-    if pd.isna(valor):
-        return pd.NaT
+    try:
+        if pd.isna(valor):
+            return pd.NaT
+    except TypeError:
+        pass
 
     if isinstance(valor, pd.Timestamp):
         return valor
@@ -78,124 +257,630 @@ def _converter_data(valor: object):
     return pd.to_datetime(valor, dayfirst=True, errors="coerce")
 
 
-def processar_sudoeste(
-    base_excel: bytes,
-    pagamentos_excel: bytes,
-    relatorio_acionamentos_excel: bytes,
-    denodo: bytes,
-) -> io.BytesIO:
-    logger.info("=" * 10)
+def _formatar_data_saida(valor: object) -> str | None:
+    data = _converter_data(valor)
+    if pd.isna(data):
+        return None
+    return data.strftime("%d/%m/%Y")
 
-    df_base = _ler_tabela_upload(base_excel)
-    df_pagamentos = _ler_tabela_upload(pagamentos_excel)
-    df_relatorio = _ler_tabela_upload(relatorio_acionamentos_excel)
-    _ = _ler_tabela_upload(denodo)
 
-    base_associado_col = _require_column(df_base, "associado")
-    base_contrato_col = _require_column(df_base, "n do contrato", "no do contrato")
-    base_parcela_col = _require_column(df_base, "n parcela", "no parcela")
-    base_vencimento_col = _require_column(df_base, "vencimento")
-    base_agencia_col = _require_column(df_base, "agencia")
+def _formatar_vencimento_saida(valor: object) -> str | None:
+    data = _converter_data(valor)
+    if pd.notna(data):
+        return data.strftime("%d/%m/%Y")
 
-    pagamento_data_col = _require_column(df_pagamentos, "data")
-    pagamento_conta_col = _require_column(df_pagamentos, "conta")
-    pagamento_associado_col = _require_column(df_pagamentos, "associado")
-    pagamento_titulo_col = _require_column(df_pagamentos, "titulo")
-    pagamento_parcela_col = _require_column(df_pagamentos, "parcela")
-    pagamento_valor_col = _require_column(df_pagamentos, "valor titulo")
-    pagamento_historico_col = _require_column(df_pagamentos, "historico")
-    pagamento_cpf_col = _require_column(df_pagamentos, "cpf/cnpj")
+    try:
+        if pd.isna(valor):
+            return None
+    except TypeError:
+        pass
 
-    relatorio_data_acionamento_col = _require_column(df_relatorio, "dt acionamento")
-    relatorio_nome_col = _require_column(df_relatorio, "nome/razao", "clientenome")
+    texto = str(valor).strip()
+    return texto or None
 
-    df_pagamentos[pagamento_titulo_col] = df_pagamentos[pagamento_titulo_col].apply(_converter_cartao)
-    df_pagamentos[pagamento_data_col] = df_pagamentos[pagamento_data_col].apply(_converter_data)
-    df_base[base_vencimento_col] = df_base[base_vencimento_col].apply(_converter_data)
-    df_relatorio[relatorio_data_acionamento_col] = df_relatorio[relatorio_data_acionamento_col].apply(
-        _converter_data
-    )
 
-    historico_numerico = pd.to_numeric(df_pagamentos[pagamento_historico_col], errors="coerce")
-    df_pagamentos[pagamento_historico_col] = historico_numerico
-    df_pagamentos = df_pagamentos[
-        historico_numerico.isin([1, 2, 3, 4]) | historico_numerico.isna()
-    ].copy()
+def _coalesce(*values: object) -> object:
+    for value in values:
+        try:
+            if pd.isna(value):
+                continue
+        except TypeError:
+            pass
+        if isinstance(value, str) and not value.strip():
+            continue
+        if value in ("", None):
+            continue
+        return value
+    return None
 
-    df_base = df_base.drop_duplicates(
-        subset=[base_associado_col, base_contrato_col, base_parcela_col, base_vencimento_col]
-    ).copy()
 
-    merge = pd.merge(
-        df_pagamentos,
+def _stringify_indices(indices: tuple[int, ...], dataframe: pd.DataFrame) -> str | None:
+    if not indices:
+        return None
+    return ", ".join(str(int(dataframe.iloc[idx]["_source_row"])) for idx in indices)
+
+
+def _stringify_values(values: tuple[object, ...]) -> str | None:
+    if not values:
+        return None
+    return ", ".join(str(value) for value in values)
+
+
+def _format_match_key(kind: str, key: str) -> str | None:
+    if not key:
+        return None
+    return f"tipo={kind}; chave={key}"
+
+
+def _format_denodo_lookup_key(cpf: str, kind: str, key: str) -> str | None:
+    if not cpf or not key:
+        return None
+    return f"cpf={cpf}; tipo={kind}; chave={key}"
+
+
+def _prepare_base(df_base: pd.DataFrame) -> pd.DataFrame:
+    associado_col = _require_column(df_base, "associado", "nome/razao", "nome razao")
+    cpf_col = _require_column(df_base, "cpf", "cpf/cnpj", "cpf cnpj")
+    contrato_col = _require_column(
         df_base,
-        left_on=[pagamento_associado_col, pagamento_titulo_col, pagamento_parcela_col],
-        right_on=[base_associado_col, base_contrato_col, base_parcela_col],
-        how="inner",
+        "n do contrato",
+        "no do contrato",
+        "numero do contrato",
+        "n contrato",
+        "contrato",
+        "titulo",
+    )
+    parcela_col = _require_column(df_base, "n parcela", "no parcela", "numero parcela", "parcela")
+
+    base = df_base.copy()
+    base["_source_row"] = base.index + 2
+    base["_associado_col"] = associado_col
+    base["_cpf_col"] = cpf_col
+    base["_contrato_col"] = contrato_col
+    base["_parcela_col"] = parcela_col
+    base["_ag_col"] = _find_column(base, "ag", "agencia", "ag.")
+    base["_conta_col"] = _find_column(base, "conta")
+    base["_vencimento_col"] = _find_column(base, "vencimento", "venc. parcela", "venc parcela")
+    base["_associado_norm"] = base[associado_col].apply(_normalize_text)
+    base["_cpf_norm"] = base[cpf_col].apply(_normalize_cpf_cnpj)
+    base["_parcela_norm"] = base[parcela_col].apply(_normalize_parcela)
+    base["_title_class"] = base[contrato_col].apply(_classify_title)
+    base["_title_kind"] = base["_title_class"].map(lambda item: item.kind)
+    base["_title_key"] = base["_title_class"].map(lambda item: item.key)
+
+    dedupe_columns = [
+        "_cpf_norm",
+        "_title_kind",
+        "_title_key",
+        "_parcela_norm",
+        "_associado_norm",
+    ]
+    return base.drop_duplicates(subset=dedupe_columns).reset_index(drop=True)
+
+
+def _prepare_recebimento(df_recebimento: pd.DataFrame) -> tuple[pd.DataFrame, RecebimentoStats]:
+    associado_col = _require_column(df_recebimento, "associado", "nome/razao", "nome razao")
+    titulo_col = _require_column(df_recebimento, "titulo", "title")
+    parcela_col = _require_column(df_recebimento, "parcela", "n parcela")
+    valor_col = _require_column(df_recebimento, "valor titulo", "valor do titulo")
+    historico_col = _require_column(df_recebimento, "historico")
+    data_col = _require_column(df_recebimento, "data", "data pagamento", "data pgto")
+
+    recebimento = df_recebimento.copy()
+    cpf_col = _find_column(recebimento, "cpf", "cpf/cnpj", "cpf cnpj")
+    recebimento["_source_row"] = recebimento.index + 2
+    recebimento["_associado_col"] = associado_col
+    recebimento["_titulo_col"] = titulo_col
+    recebimento["_parcela_col"] = parcela_col
+    recebimento["_valor_col"] = valor_col
+    recebimento["_historico_col"] = historico_col
+    recebimento["_data_col"] = data_col
+    recebimento["_cpf_col"] = cpf_col
+    recebimento["_ag_col"] = _find_column(recebimento, "ag", "agencia", "ag.")
+    recebimento["_conta_col"] = _find_column(recebimento, "conta")
+
+    total_entrada = len(recebimento)
+    historico_numerico = pd.to_numeric(recebimento[historico_col], errors="coerce")
+    filtro_historico = historico_numerico.isin([1, 2, 3, 4]) | historico_numerico.isna()
+    total_consideradas = int(filtro_historico.sum())
+    total_ignoradas_historico = int((~filtro_historico).sum())
+
+    recebimento = recebimento[filtro_historico].copy()
+    if recebimento.empty:
+        raise ValueError("Nenhuma linha valida encontrada no recebimento apos filtrar Historico.")
+
+    recebimento["_ordem"] = range(len(recebimento))
+    recebimento["_historico_saida"] = historico_numerico.loc[recebimento.index].apply(
+        lambda value: int(value) if pd.notna(value) else None
+    )
+    recebimento["_data_pagamento"] = recebimento[data_col].apply(_converter_data)
+    recebimento["_associado_norm"] = recebimento[associado_col].apply(_normalize_text)
+    recebimento["_cpf_norm"] = (
+        recebimento[cpf_col].apply(_normalize_cpf_cnpj)
+        if cpf_col
+        else ""
+    )
+    recebimento["_parcela_norm"] = recebimento[parcela_col].apply(_normalize_parcela)
+    recebimento["_title_class"] = recebimento[titulo_col].apply(_classify_title)
+    recebimento["_title_kind"] = recebimento["_title_class"].map(lambda item: item.kind)
+    recebimento["_title_key"] = recebimento["_title_class"].map(lambda item: item.key)
+
+    stats = RecebimentoStats(
+        total_entrada=total_entrada,
+        total_consideradas=total_consideradas,
+        total_ignoradas_historico=total_ignoradas_historico,
+    )
+    return recebimento.reset_index(drop=True), stats
+
+
+def _prepare_denodo(df_denodo: pd.DataFrame) -> pd.DataFrame:
+    protocolo_col = _require_column(df_denodo, "protocolo")
+    cpf_col = _require_column(df_denodo, "cpf_cnpj_formatado", "cpf cnpj formatado", "cpf/cnpj formatado")
+    solucao_col = _require_column(df_denodo, "solucao_associada", "solucao associada")
+
+    denodo = df_denodo.copy()
+    denodo["_source_row"] = denodo.index + 2
+    denodo["_protocolo_col"] = protocolo_col
+    denodo["_cpf_col"] = cpf_col
+    denodo["_solucao_col"] = solucao_col
+    denodo["_cpf_norm"] = denodo[cpf_col].apply(_normalize_cpf_cnpj)
+    denodo["_title_class"] = denodo[solucao_col].apply(_classify_title)
+    denodo["_title_kind"] = denodo["_title_class"].map(lambda item: item.kind)
+    denodo["_title_key"] = denodo["_title_class"].map(lambda item: item.key)
+    return denodo
+
+
+def _build_base_indexes(base: pd.DataFrame) -> dict[str, dict[object, list[int]]]:
+    by_cpf: dict[str, list[int]] = defaultdict(list)
+    by_associado: dict[str, list[int]] = defaultdict(list)
+    by_title: dict[tuple[str, str], list[int]] = defaultdict(list)
+
+    for idx, row in base.iterrows():
+        if row["_cpf_norm"]:
+            by_cpf[row["_cpf_norm"]].append(idx)
+        if row["_associado_norm"]:
+            by_associado[row["_associado_norm"]].append(idx)
+        if row["_title_key"]:
+            by_title[(row["_title_kind"], row["_title_key"])].append(idx)
+
+    return {"by_cpf": by_cpf, "by_associado": by_associado, "by_title": by_title}
+
+
+def _build_candidate_pool(
+    recebimento_row: pd.Series,
+    indexes: dict[str, dict[object, list[int]]],
+) -> CandidatePool:
+    kind = recebimento_row["_title_kind"]
+    key = recebimento_row["_title_key"]
+    cpf = recebimento_row["_cpf_norm"]
+    associado = recebimento_row["_associado_norm"]
+
+    title_candidates = set(indexes["by_title"].get((kind, key), [])) if key else set()
+    support_candidates = set()
+
+    if cpf:
+        support_candidates.update(indexes["by_cpf"].get(cpf, []))
+    if associado:
+        support_candidates.update(indexes["by_associado"].get(associado, []))
+
+    if kind in {"contract", "card", "chi", "text"}:
+        if title_candidates and support_candidates:
+            intersection = title_candidates & support_candidates
+            candidate_indexes = intersection if intersection else title_candidates
+        else:
+            candidate_indexes = title_candidates
+    else:
+        candidate_indexes = support_candidates
+
+    return CandidatePool(
+        title_candidates=tuple(sorted(title_candidates)),
+        support_candidates=tuple(sorted(support_candidates)),
+        candidate_indexes=tuple(sorted(candidate_indexes)),
     )
 
-    if merge.empty:
-        raise ValueError("Nenhuma linha correspondente foi encontrada entre pagamentos e base.")
 
-    data_acionamento = (
-        pd.merge(
-            df_pagamentos[[pagamento_associado_col]].drop_duplicates(),
-            df_relatorio[[relatorio_nome_col, relatorio_data_acionamento_col]],
-            left_on=pagamento_associado_col,
-            right_on=relatorio_nome_col,
-            how="left",
+def _score_base_match(recebimento_row: pd.Series, base_row: pd.Series) -> int | None:
+    same_cpf = bool(recebimento_row["_cpf_norm"]) and recebimento_row["_cpf_norm"] == base_row["_cpf_norm"]
+    same_associado = bool(recebimento_row["_associado_norm"]) and recebimento_row["_associado_norm"] == base_row["_associado_norm"]
+    same_parcela = (
+        bool(recebimento_row["_parcela_norm"])
+        and bool(base_row["_parcela_norm"])
+        and recebimento_row["_parcela_norm"] == base_row["_parcela_norm"]
+    )
+    parcela_conflict = (
+        bool(recebimento_row["_parcela_norm"])
+        and bool(base_row["_parcela_norm"])
+        and recebimento_row["_parcela_norm"] != base_row["_parcela_norm"]
+    )
+    same_kind = recebimento_row["_title_kind"] == base_row["_title_kind"]
+    same_key = recebimento_row["_title_key"] == base_row["_title_key"]
+
+    if not same_kind or not same_key:
+        return None
+
+    kind = recebimento_row["_title_kind"]
+    if kind == "contract":
+        if not (same_cpf or same_associado) or parcela_conflict:
+            return None
+        score = 100
+        if same_cpf:
+            score += 40
+        if same_parcela:
+            score += 25
+        if same_associado:
+            score += 10
+        return score
+
+    if kind in {"card", "chi"}:
+        if not (same_cpf or same_associado) or parcela_conflict:
+            return None
+        score = 80
+        if same_cpf:
+            score += 30
+        if same_parcela:
+            score += 20
+        if same_associado:
+            score += 10
+        return score
+
+    matched_supports = sum([same_cpf, same_associado, same_parcela])
+    if matched_supports < 2:
+        return None
+
+    score = 40
+    if same_cpf:
+        score += 25
+    if same_associado:
+        score += 15
+    if same_parcela:
+        score += 10
+    return score
+
+
+def _describe_base_missing(recebimento_row: pd.Series, pool: CandidatePool) -> str:
+    if not pool.title_candidates:
+        return (
+            "nenhuma linha da base para "
+            f"tipo={recebimento_row['_title_kind']} chave={recebimento_row['_title_key'] or '<vazia>'}"
         )
-        .dropna(subset=[relatorio_data_acionamento_col])
-        .groupby(pagamento_associado_col)[relatorio_data_acionamento_col]
-        .max()
-        .to_dict()
-    )
+    if not pool.support_candidates:
+        return "candidatos por titulo existem, mas nao houve apoio seguro por CPF ou associado"
+    return "candidatos encontrados na base, mas todos foram reprovados pela regra de seguranca"
 
-    dados_relatorio = []
-    for _, row in merge.iterrows():
-        data_pagamento = row.get(pagamento_data_col)
-        vencimento = row.get(base_vencimento_col)
-        ultimo_acionamento = data_acionamento.get(row.get(pagamento_associado_col))
 
-        dados_relatorio.append(
-            {
-                "Ag.": row.get(base_agencia_col),
-                "Conta": row.get(pagamento_conta_col),
-                "Associado": row.get(pagamento_associado_col),
-                "CPF/CNPJ": row.get(pagamento_cpf_col),
-                "Título": row.get(pagamento_titulo_col),
-                "Parcela": row.get(pagamento_parcela_col),
-                "Valor Título": row.get(pagamento_valor_col),
-                "Histórico": row.get(pagamento_historico_col),
-                "Data": data_pagamento.strftime("%d/%m/%Y") if pd.notna(data_pagamento) else "",
-                "Atraso": (
-                    (data_pagamento.to_pydatetime() - vencimento.to_pydatetime()).days
-                    if pd.notna(data_pagamento) and pd.notna(vencimento)
-                    else None
-                ),
-                "% Receita": None,
-                "Receita": None,
-                "Dt Último Acionamento": (
-                    ultimo_acionamento.strftime("%d/%m/%Y") if pd.notna(ultimo_acionamento) else None
-                ),
-                "Situacao": None,
-                "Vencimento Parcela": (
-                    vencimento.strftime("%d/%m/%Y") if pd.notna(vencimento) else None
-                ),
-            }
+def _find_best_base_match(
+    recebimento_row: pd.Series,
+    base: pd.DataFrame,
+    indexes: dict[str, dict[object, list[int]]],
+) -> BaseMatchDecision:
+    pool = _build_candidate_pool(recebimento_row, indexes)
+    if not pool.candidate_indexes:
+        return BaseMatchDecision(
+            status=BASE_STATUS_MISSING,
+            detail=_describe_base_missing(recebimento_row, pool),
+            candidate_indexes=pool.candidate_indexes,
         )
 
-    dataframe_saida = pd.DataFrame(dados_relatorio).sort_values(
-        by=["Associado", "Parcela"], ascending=[True, True]
+    scored_candidates: list[tuple[int, int]] = []
+    for idx in pool.candidate_indexes:
+        score = _score_base_match(recebimento_row, base.iloc[idx])
+        if score is not None:
+            scored_candidates.append((score, idx))
+
+    if not scored_candidates:
+        return BaseMatchDecision(
+            status=BASE_STATUS_MISSING,
+            detail=_describe_base_missing(recebimento_row, pool),
+            candidate_indexes=pool.candidate_indexes,
+        )
+
+    scored_candidates.sort(reverse=True)
+    best_score, best_idx = scored_candidates[0]
+    tied_candidates = tuple(idx for score, idx in scored_candidates if score == best_score)
+
+    if len(tied_candidates) > 1:
+        return BaseMatchDecision(
+            status=BASE_STATUS_AMBIGUOUS,
+            detail=f"empate entre linhas da base com score {best_score}: {_stringify_indices(tied_candidates, base)}",
+            candidate_indexes=pool.candidate_indexes,
+            scored_candidates=tuple(scored_candidates),
+        )
+
+    matched_row = base.iloc[best_idx]
+    return BaseMatchDecision(
+        status=BASE_STATUS_CONFIRMED,
+        detail=f"linha {int(matched_row['_source_row'])} da base confirmada com score {best_score}",
+        matched_row=matched_row,
+        matched_index=best_idx,
+        matched_key=_format_match_key(matched_row["_title_kind"], matched_row["_title_key"]),
+        candidate_indexes=pool.candidate_indexes,
+        scored_candidates=tuple(scored_candidates),
     )
 
-    diretos = dataframe_saida[dataframe_saida["Dt Último Acionamento"].notna()]
-    indiretos = dataframe_saida[dataframe_saida["Dt Último Acionamento"].isna()]
 
+def _build_denodo_lookup(denodo: pd.DataFrame) -> dict[tuple[str, str, str], DenodoLookupEntry]:
+    grouped: dict[tuple[str, str, str], dict[str, list[object]]] = defaultdict(lambda: {"protocolos": [], "source_rows": []})
+
+    for _, row in denodo.iterrows():
+        cpf = row["_cpf_norm"]
+        kind = row["_title_kind"]
+        key = row["_title_key"]
+        protocolo = str(row[row["_protocolo_col"]]).strip()
+        if not cpf or not key or not protocolo:
+            continue
+
+        match_key = (cpf, kind, key)
+        grouped[match_key]["protocolos"].append(protocolo)
+        grouped[match_key]["source_rows"].append(int(row["_source_row"]))
+
+    lookup: dict[tuple[str, str, str], DenodoLookupEntry] = {}
+    for match_key, values in grouped.items():
+        protocolos = tuple(sorted(set(values["protocolos"])))
+        source_rows = tuple(sorted(set(int(row) for row in values["source_rows"])))
+        if len(protocolos) == 1:
+            lookup[match_key] = DenodoLookupEntry(
+                status=DENODO_STATUS_CONFIRMED,
+                protocolo=protocolos[0],
+                protocolos=protocolos,
+                source_rows=source_rows,
+            )
+        else:
+            lookup[match_key] = DenodoLookupEntry(
+                status=DENODO_STATUS_AMBIGUOUS,
+                protocolo=None,
+                protocolos=protocolos,
+                source_rows=source_rows,
+            )
+    return lookup
+
+
+def _find_denodo_match(
+    recebimento_row: pd.Series,
+    base_decision: BaseMatchDecision,
+    lookup: dict[tuple[str, str, str], DenodoLookupEntry],
+) -> DenodoMatchDecision:
+    cpf = recebimento_row["_cpf_norm"]
+    if not cpf and base_decision.matched_row is not None:
+        cpf = base_decision.matched_row["_cpf_norm"]
+
+    if base_decision.matched_row is not None:
+        kind = base_decision.matched_row["_title_kind"]
+        key = base_decision.matched_row["_title_key"]
+    else:
+        kind = recebimento_row["_title_kind"]
+        key = recebimento_row["_title_key"]
+
+    lookup_key_str = _format_denodo_lookup_key(cpf, kind, key)
+    if not cpf:
+        return DenodoMatchDecision(
+            status=DENODO_STATUS_MISSING,
+            detail="CPF/CNPJ ausente para consultar a denodo",
+            lookup_key=lookup_key_str,
+        )
+    if not key:
+        return DenodoMatchDecision(
+            status=DENODO_STATUS_MISSING,
+            detail="chave de titulo/contrato ausente para consultar a denodo",
+            lookup_key=lookup_key_str,
+        )
+
+    lookup_key = (cpf, kind, key)
+    entry = lookup.get(lookup_key)
+    if entry is None:
+        return DenodoMatchDecision(
+            status=DENODO_STATUS_MISSING,
+            detail=f"nenhum registro na denodo para tipo={kind} chave={key}",
+            lookup_key=lookup_key_str,
+        )
+
+    if entry.status == DENODO_STATUS_AMBIGUOUS:
+        return DenodoMatchDecision(
+            status=DENODO_STATUS_AMBIGUOUS,
+            detail=f"multiplos protocolos na denodo para a mesma chave: {_stringify_values(entry.protocolos)}",
+            lookup_key=lookup_key_str,
+            protocolos=entry.protocolos,
+            source_rows=entry.source_rows,
+        )
+
+    return DenodoMatchDecision(
+        status=DENODO_STATUS_CONFIRMED,
+        detail=f"protocolo {entry.protocolo} confirmado na(s) linha(s) {_stringify_values(entry.source_rows)}",
+        protocolo=entry.protocolo,
+        lookup_key=lookup_key_str,
+        protocolos=entry.protocolos,
+        source_rows=entry.source_rows,
+    )
+
+
+def _build_output_row(
+    recebimento_row: pd.Series,
+    base_decision: BaseMatchDecision,
+    denodo_decision: DenodoMatchDecision,
+) -> dict[str, object]:
+    base_row = base_decision.matched_row
+
+    recebimento_ag = recebimento_row[recebimento_row["_ag_col"]] if recebimento_row["_ag_col"] else None
+    recebimento_conta = recebimento_row[recebimento_row["_conta_col"]] if recebimento_row["_conta_col"] else None
+    recebimento_cpf = recebimento_row[recebimento_row["_cpf_col"]] if recebimento_row["_cpf_col"] else None
+
+    base_ag = base_row[base_row["_ag_col"]] if base_row is not None and base_row["_ag_col"] else None
+    base_conta = base_row[base_row["_conta_col"]] if base_row is not None and base_row["_conta_col"] else None
+    base_associado = base_row[base_row["_associado_col"]] if base_row is not None else None
+    base_cpf = base_row[base_row["_cpf_col"]] if base_row is not None else None
+    base_titulo = base_row[base_row["_contrato_col"]] if base_row is not None else None
+    base_vencimento = (
+        base_row[base_row["_vencimento_col"]]
+        if base_row is not None and base_row["_vencimento_col"]
+        else None
+    )
+
+    return {
+        "AG": _coalesce(recebimento_ag, base_ag),
+        "Conta": _coalesce(recebimento_conta, base_conta),
+        "Associado": _coalesce(recebimento_row[recebimento_row["_associado_col"]], base_associado),
+        "CPF/CNPJ": _coalesce(recebimento_cpf, base_cpf),
+        "Titulo": _coalesce(recebimento_row[recebimento_row["_titulo_col"]], base_titulo),
+        "Parcela": recebimento_row[recebimento_row["_parcela_col"]],
+        "Valor Título": recebimento_row[recebimento_row["_valor_col"]],
+        "Histórico": recebimento_row["_historico_saida"],
+        "Data": _formatar_data_saida(recebimento_row["_data_pagamento"]),
+        "Atraso": None,
+        "%receita": None,
+        "receita": None,
+        "Dt Ultimo Acionamento": None,
+        "Situação": None,
+        "Venc. Parcela": _formatar_vencimento_saida(base_vencimento),
+        "Protocolo": denodo_decision.protocolo,
+    }
+
+
+def _build_diagnostic_row(
+    recebimento_row: pd.Series,
+    base_decision: BaseMatchDecision,
+    denodo_decision: DenodoMatchDecision,
+) -> dict[str, object]:
+    recebimento_cpf = recebimento_row[recebimento_row["_cpf_col"]] if recebimento_row["_cpf_col"] else None
+    base_line = int(base_decision.matched_row["_source_row"]) if base_decision.matched_row is not None else None
+
+    return {
+        "Linha Recebimento": int(recebimento_row["_source_row"]),
+        "Associado": recebimento_row[recebimento_row["_associado_col"]],
+        "CPF/CNPJ": recebimento_cpf,
+        "Titulo": recebimento_row[recebimento_row["_titulo_col"]],
+        "Parcela": recebimento_row[recebimento_row["_parcela_col"]],
+        "Tipo Titulo Recebimento": recebimento_row["_title_kind"],
+        "Chave Normalizada Recebimento": recebimento_row["_title_key"],
+        "CPF Normalizado": recebimento_row["_cpf_norm"] or None,
+        "Parcela Normalizada": recebimento_row["_parcela_norm"] or None,
+        "Associado Normalizado": recebimento_row["_associado_norm"] or None,
+        "Status Base": base_decision.status,
+        "Detalhe Base": base_decision.detail,
+        "Linha Base": base_line,
+        "Chave Base Selecionada": base_decision.matched_key,
+        "Status Denodo": denodo_decision.status,
+        "Detalhe Denodo": denodo_decision.detail,
+        "Chave Denodo Selecionada": denodo_decision.lookup_key,
+        "Linhas Denodo": _stringify_values(denodo_decision.source_rows),
+        "Protocolos Denodo": _stringify_values(denodo_decision.protocolos),
+        "Protocolo Resultado": denodo_decision.protocolo,
+    }
+
+
+def _gerar_resumo_execucao(
+    diagnostico_df: pd.DataFrame,
+    recebimento_stats: RecebimentoStats,
+) -> pd.DataFrame:
+    resumo_rows = [
+        {"Indicador": "total de linhas recebimento consideradas", "Valor": int(recebimento_stats.total_consideradas)},
+        {"Indicador": "total de linhas ignoradas por historico", "Valor": int(recebimento_stats.total_ignoradas_historico)},
+        {"Indicador": "total com match base confirmado", "Valor": int((diagnostico_df["Status Base"] == BASE_STATUS_CONFIRMED).sum())},
+        {"Indicador": "total sem match base", "Valor": int((diagnostico_df["Status Base"] == BASE_STATUS_MISSING).sum())},
+        {"Indicador": "total match base ambiguo", "Valor": int((diagnostico_df["Status Base"] == BASE_STATUS_AMBIGUOUS).sum())},
+        {"Indicador": "total com protocolo confirmado", "Valor": int((diagnostico_df["Status Denodo"] == DENODO_STATUS_CONFIRMED).sum())},
+        {"Indicador": "total sem match denodo", "Valor": int((diagnostico_df["Status Denodo"] == DENODO_STATUS_MISSING).sum())},
+        {"Indicador": "total match denodo ambiguo", "Valor": int((diagnostico_df["Status Denodo"] == DENODO_STATUS_AMBIGUOUS).sum())},
+    ]
+    return pd.DataFrame(resumo_rows, columns=SUMMARY_COLUMNS)
+
+
+def _exportar_excel(dataframe: pd.DataFrame, sheet_name: str) -> io.BytesIO:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        diretos.to_excel(writer, sheet_name="DIRETOS", startrow=1, index=False, header=True)
-        indiretos.to_excel(writer, sheet_name="INDIRETOS", startrow=1, index=False, header=True)
-
+        dataframe.to_excel(writer, sheet_name=sheet_name, index=False)
     output.seek(0)
     return output
+
+
+def _exportar_diagnostico_com_resumo(diagnostico_df: pd.DataFrame, resumo_df: pd.DataFrame) -> io.BytesIO:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        resumo_df.to_excel(writer, sheet_name="Resumo", index=False)
+        diagnostico_df.to_excel(writer, sheet_name="Diagnostico", index=False)
+    output.seek(0)
+    return output
+
+
+def _processar_sudoeste_frames(
+    base_excel: bytes,
+    recebimento_excel: bytes,
+    denodo_excel: bytes,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    df_base = _ler_tabela_upload(base_excel)
+    df_recebimento = _ler_tabela_upload(recebimento_excel)
+    df_denodo = _ler_tabela_upload(denodo_excel)
+
+    base = _prepare_base(df_base)
+    recebimento, recebimento_stats = _prepare_recebimento(df_recebimento)
+    denodo = _prepare_denodo(df_denodo)
+
+    base_indexes = _build_base_indexes(base)
+    denodo_lookup = _build_denodo_lookup(denodo)
+
+    output_rows = []
+    diagnostic_rows = []
+
+    for _, recebimento_row in recebimento.sort_values("_ordem").iterrows():
+        base_decision = _find_best_base_match(recebimento_row, base, base_indexes)
+        denodo_decision = _find_denodo_match(recebimento_row, base_decision, denodo_lookup)
+        output_rows.append(_build_output_row(recebimento_row, base_decision, denodo_decision))
+        diagnostic_rows.append(_build_diagnostic_row(recebimento_row, base_decision, denodo_decision))
+
+    output_df = pd.DataFrame(output_rows, columns=OUTPUT_COLUMNS)
+    diagnostic_df = pd.DataFrame(diagnostic_rows, columns=DIAGNOSTIC_COLUMNS)
+    resumo_df = _gerar_resumo_execucao(diagnostic_df, recebimento_stats)
+    return output_df, diagnostic_df, resumo_df
+
+
+def processar_sudoeste(
+    base_excel: bytes,
+    recebimento_excel: bytes,
+    denodo_excel: bytes,
+) -> io.BytesIO:
+    logger.info("=" * 10)
+    output_df, _, _ = _processar_sudoeste_frames(base_excel, recebimento_excel, denodo_excel)
+    return _exportar_excel(output_df, "Sudoeste Inicial")
+
+
+def diagnosticar_sudoeste(
+    base_excel: bytes,
+    recebimento_excel: bytes,
+    denodo_excel: bytes,
+) -> pd.DataFrame:
+    _, diagnostic_df, _ = _processar_sudoeste_frames(base_excel, recebimento_excel, denodo_excel)
+    return diagnostic_df
+
+
+def resumir_execucao_sudoeste(
+    base_excel: bytes,
+    recebimento_excel: bytes,
+    denodo_excel: bytes,
+) -> pd.DataFrame:
+    _, _, resumo_df = _processar_sudoeste_frames(base_excel, recebimento_excel, denodo_excel)
+    return resumo_df
+
+
+def processar_sudoeste_com_diagnostico(
+    base_excel: bytes,
+    recebimento_excel: bytes,
+    denodo_excel: bytes,
+) -> tuple[io.BytesIO, pd.DataFrame]:
+    output_df, diagnostic_df, _ = _processar_sudoeste_frames(base_excel, recebimento_excel, denodo_excel)
+    return _exportar_excel(output_df, "Sudoeste Inicial"), diagnostic_df
+
+
+def processar_sudoeste_com_diagnostico_e_resumo(
+    base_excel: bytes,
+    recebimento_excel: bytes,
+    denodo_excel: bytes,
+) -> tuple[io.BytesIO, pd.DataFrame, pd.DataFrame]:
+    output_df, diagnostic_df, resumo_df = _processar_sudoeste_frames(base_excel, recebimento_excel, denodo_excel)
+    return _exportar_excel(output_df, "Sudoeste Inicial"), diagnostic_df, resumo_df
+
+
+def exportar_diagnostico_sudoeste(
+    base_excel: bytes,
+    recebimento_excel: bytes,
+    denodo_excel: bytes,
+) -> io.BytesIO:
+    _, diagnostic_df, resumo_df = _processar_sudoeste_frames(base_excel, recebimento_excel, denodo_excel)
+    return _exportar_diagnostico_com_resumo(diagnostic_df, resumo_df)
