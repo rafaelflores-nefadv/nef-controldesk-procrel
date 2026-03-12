@@ -3,7 +3,7 @@ import logging
 from typing import Callable
 import uuid
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -90,6 +90,7 @@ async def _executar_fluxo_upload(
     uploads: dict[str, UploadFile | None],
     processor: Callable[..., object],
     output_filename: str,
+    multipart_keys: list[str] | None = None,
 ) -> StreamingResponse:
     request_id = uuid.uuid4().hex
     context_token = bind_log_context(request_id=request_id, fluxo=fluxo)
@@ -108,6 +109,20 @@ async def _executar_fluxo_upload(
             "Arquivos recebidos na requisicao",
             arquivos=received_files,
         )
+        if multipart_keys is not None:
+            log_info(
+                logger,
+                "Chaves multipart recebidas na requisicao",
+                chaves_multipart=multipart_keys,
+            )
+            unexpected_keys = [key for key in multipart_keys if key not in expected_fields]
+            if unexpected_keys:
+                log_warning(
+                    logger,
+                    "Chaves multipart inesperadas detectadas",
+                    chaves_inesperadas=unexpected_keys,
+                    chaves_aceitas=expected_fields,
+                )
 
         missing_fields = _get_missing_fields(uploads)
         if missing_fields:
@@ -167,66 +182,81 @@ async def _executar_fluxo_upload(
 
 @app.post("/planalto")
 async def planalto(
+    request: Request,
     recebimento: UploadFile | None = File(None),
     pagamento: UploadFile | None = File(None),
 ):
+    multipart_keys = list((await request.form()).keys())
     return await _executar_fluxo_upload(
         fluxo="planalto",
         uploads={"recebimento": recebimento, "pagamento": pagamento},
         processor=processar_planalto,
         output_filename="planalto_processado.xlsx",
+        multipart_keys=multipart_keys,
     )
 
 
 @app.post("/sudoeste")
 async def sudoeste(
+    request: Request,
     base: UploadFile | None = File(None),
     recebimento: UploadFile | None = File(None),
     denodo: UploadFile | None = File(None),
 ):
+    multipart_keys = list((await request.form()).keys())
     return await _executar_fluxo_upload(
         fluxo="sudoeste-inicial",
         uploads={"base": base, "recebimento": recebimento, "denodo": denodo},
         processor=processar_sudoeste,
         output_filename="sudoeste_inicial_processado.xlsx",
+        multipart_keys=multipart_keys,
     )
 
 
 @app.post("/sudoeste-direto")
 async def sudoeste_direto(
+    request: Request,
     processada: UploadFile | None = File(None),
     direta: UploadFile | None = File(None),
 ):
+    multipart_keys = list((await request.form()).keys())
     return await _executar_fluxo_upload(
         fluxo="sudoeste-direto",
         uploads={"processada": processada, "direta": direta},
         processor=processar_sudoeste_direto,
         output_filename="sudoeste_direto_processado.xlsx",
+        multipart_keys=multipart_keys,
     )
 
 
 @app.post("/sudoeste-indireto")
 async def sudoeste_indireto(
+    request: Request,
     processada: UploadFile | None = File(None),
     indireto: UploadFile | None = File(None),
 ):
+    multipart_keys = list((await request.form()).keys())
     return await _executar_fluxo_upload(
         fluxo="sudoeste-indireto",
         uploads={"processada": processada, "indireto": indireto},
         processor=processar_sudoeste_indireto,
         output_filename="sudoeste_indireto_processado.xlsx",
+        multipart_keys=multipart_keys,
     )
 
 
 @app.post("/sudoeste-consolidado")
 async def sudoeste_consolidado(
+    request: Request,
     processada: UploadFile | None = File(None),
     direta: UploadFile | None = File(None),
     indireto: UploadFile | None = File(None),
 ):
+    multipart_keys = list((await request.form()).keys())
     return await _executar_fluxo_upload(
         fluxo="sudoeste-consolidado",
         uploads={"processada": processada, "direta": direta, "indireto": indireto},
         processor=processar_sudoeste_consolidado,
         output_filename="sudoeste_consolidado_processado.xlsx",
+        multipart_keys=multipart_keys,
     )

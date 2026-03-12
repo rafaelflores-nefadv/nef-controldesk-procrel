@@ -48,6 +48,25 @@ class ApiObservabilityTests(unittest.TestCase):
         )
         self.assertTrue(any('"request_id":' in message for message in captured_logs.output))
 
+    def test_fluxo_sudoeste_nao_aceita_chave_antiga_relatorio(self):
+        files = {
+            "base": ("base.xlsx", b"base-content", "application/octet-stream"),
+            "relatorio": ("relatorio.xlsx", b"relatorio-content", "application/octet-stream"),
+            "denodo": ("denodo.xlsx", b"denodo-content", "application/octet-stream"),
+        }
+
+        with self.assertLogs("app.api", level="WARNING") as captured_logs:
+            response = self.client.post("/sudoeste", files=files)
+
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("Faltando: recebimento", response.json()["detail"])
+        self.assertTrue(
+            any("Chaves multipart inesperadas detectadas" in message for message in captured_logs.output)
+        )
+        self.assertTrue(
+            any('"chaves_inesperadas": ["relatorio"]' in message for message in captured_logs.output)
+        )
+
     def test_dispara_logs_do_endpoint_em_requisicao_valida(self):
         files = {
             "base": ("base.xlsx", b"base-content", "application/octet-stream"),

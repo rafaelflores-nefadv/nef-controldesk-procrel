@@ -6,11 +6,13 @@ const FORM_CONFIG = {
         fields: [
             {
                 name: "recebimento",
+                formKey: "recebimento",
                 label: "Arquivo de recebimento",
                 hint: "Envie o XLSX de recebimento do Planalto."
             },
             {
                 name: "pagamento",
+                formKey: "pagamento",
                 label: "Arquivo de pagamento",
                 hint: "Envie o XLSX de remessa ou pagamento."
             }
@@ -30,16 +32,19 @@ const FORM_CONFIG = {
         fields: [
             {
                 name: "base",
+                formKey: "base",
                 label: "Arquivo Base",
                 hint: "Aceita CSV ou XLSX."
             },
             {
                 name: "recebimento",
+                formKey: "recebimento",
                 label: "Arquivo de Recebimento",
                 hint: "Aceita CSV ou XLSX."
             },
             {
                 name: "denodo",
+                formKey: "denodo",
                 label: "Arquivo Denodo",
                 hint: "Aceita CSV ou XLSX."
             }
@@ -49,8 +54,8 @@ const FORM_CONFIG = {
             { delayMs: 350, progress: 25, status: "Enviando arquivos...", detail: "Transferindo os arquivos para o servidor." },
             { delayMs: 1200, progress: 50, status: "Processando planilhas...", detail: "Lendo e preparando os dados para cruzamento." },
             { delayMs: 2600, progress: 65, status: "Cruzando recebimento com base...", detail: "Aplicando as regras de correspondencia." },
-            { delayMs: 4200, progress: 80, status: "Verificando pagamentos via boleto...", detail: "Buscando protocolos na Denodo." },
-            { delayMs: 6200, progress: 92, status: "Gerando arquivo final...", detail: "Montando o relatorio final para download." }
+            { delayMs: 4200, progress: 80, status: "Verificando protocolos na denodo...", detail: "Consultando as correspondencias para protocolo." },
+            { delayMs: 6200, progress: 92, status: "Gerando arquivo final...", detail: "Montando o arquivo final para download." }
         ]
     },
     sudoeste_direto: {
@@ -60,11 +65,13 @@ const FORM_CONFIG = {
         fields: [
             {
                 name: "processada",
+                formKey: "processada",
                 label: "Planilha Processada",
                 hint: "Planilha gerada no fluxo Sudoeste - inicial."
             },
             {
                 name: "direta",
+                formKey: "direta",
                 label: "Planilha Direta",
                 hint: "Planilha direta do escritorio."
             }
@@ -84,11 +91,13 @@ const FORM_CONFIG = {
         fields: [
             {
                 name: "processada",
+                formKey: "processada",
                 label: "Planilha Processada",
                 hint: "Planilha gerada no fluxo Sudoeste - inicial."
             },
             {
                 name: "indireto",
+                formKey: "indireto",
                 label: "Planilha Indireto",
                 hint: "Planilha de acionamento indireto."
             }
@@ -108,16 +117,19 @@ const FORM_CONFIG = {
         fields: [
             {
                 name: "processada",
+                formKey: "processada",
                 label: "Planilha Processada",
                 hint: "Planilha gerada no fluxo Sudoeste - inicial."
             },
             {
                 name: "direta",
+                formKey: "direta",
                 label: "Planilha Direta",
                 hint: "Planilha usada no fluxo Sudoeste - direto."
             },
             {
                 name: "indireto",
+                formKey: "indireto",
                 label: "Planilha Indireto",
                 hint: "Planilha usada no fluxo Sudoeste - indireto."
             }
@@ -147,6 +159,16 @@ const statusFile = document.getElementById("status-file");
 let currentProgress = 0;
 let progressRunId = 0;
 let progressTimers = [];
+const debugParams = new URLSearchParams(window.location.search);
+const DEBUG_UPLOAD = window.localStorage.getItem("uploadDebug") === "1" || debugParams.get("debugUpload") === "1";
+
+function debugLog(event, payload = {}) {
+    if (!DEBUG_UPLOAD) {
+        return;
+    }
+
+    console.info(`[upload-debug] ${event}`, payload);
+}
 
 function renderFields() {
     const tipo = tipoSelect.value;
@@ -164,12 +186,29 @@ function renderFields() {
                         ${field.label}
                         <span class="required-badge">Obrigatorio</span>
                     </label>
-                    <input id="${field.name}" type="file" name="${field.name}" required>
+                    <input
+                        id="${field.name}"
+                        type="file"
+                        name="${field.name}"
+                        data-field-name="${field.name}"
+                        data-form-key="${field.formKey || field.name}"
+                        data-flow="${tipo}"
+                        required
+                    >
                     <span class="hint">${field.hint}</span>
                 </div>
             `
         )
         .join("");
+
+    debugLog("campos renderizados", {
+        tipo,
+        endpoint: config.endpoint,
+        campos_esperados: config.fields.map((field) => ({
+            name: field.name,
+            formKey: field.formKey || field.name
+        }))
+    });
 
     clearFeedback();
 }
@@ -283,25 +322,69 @@ function setLoading(isLoading, text) {
     submitButton.textContent = isLoading ? text : "Enviar arquivos";
 }
 
-function buildFormData(config) {
+function buildFormData(tipo, config) {
     const formData = new FormData();
     const missing = [];
+    const appended = [];
+
+    debugLog("iniciando montagem do formData", {
+        tipo,
+        endpoint: config.endpoint,
+        campos_esperados: config.fields.map((field) => field.formKey || field.name)
+    });
 
     for (const field of config.fields) {
-        const input = document.getElementById(field.name);
+        const input = inputsContainer.querySelector(
+            `input[type="file"][data-field-name="${field.name}"]`
+        ) || document.getElementById(field.name);
         const file = input?.files?.[0];
+        const formKey = field.formKey || input?.dataset?.formKey || field.name;
+
+        debugLog("campo avaliado", {
+            tipo,
+            campo_config: field.name,
+            chave_multipart: formKey,
+            input_id: input?.id || null,
+            input_name: input?.name || null,
+            dataset_field_name: input?.dataset?.fieldName || null,
+            dataset_form_key: input?.dataset?.formKey || null,
+            arquivo: file?.name || null
+        });
 
         if (!file) {
             missing.push(field.label);
             continue;
         }
 
-        formData.append(field.name, file);
+        formData.append(formKey, file, file.name);
+        appended.push({
+            key: formKey,
+            file: file.name,
+            size: file.size,
+            type: file.type
+        });
+
+        debugLog("arquivo adicionado ao formData", {
+            tipo,
+            chave_multipart: formKey,
+            arquivo: file.name,
+            size: file.size,
+            type: file.type
+        });
     }
 
     if (missing.length > 0) {
+        debugLog("montagem do formData com campos ausentes", {
+            tipo,
+            campos_ausentes: missing
+        });
         throw new Error(`Envie todos os arquivos obrigatorios: ${missing.join(", ")}.`);
     }
+
+    debugLog("montagem do formData concluida", {
+        tipo,
+        anexos: appended
+    });
 
     return formData;
 }
@@ -383,12 +466,24 @@ async function handleSubmit(event) {
         setLoading(true, "Enviando...");
         startProgress(config);
 
-        const formData = buildFormData(config);
+        debugLog("submissao iniciada", {
+            tipo,
+            endpoint: config.endpoint
+        });
+
+        const formData = buildFormData(tipo, config);
         updateProgress(30, "Enviando arquivos...", "Transferindo os arquivos para o servidor.");
 
         const response = await fetch(config.endpoint, {
             method: "POST",
             body: formData
+        });
+        debugLog("resposta recebida", {
+            tipo,
+            endpoint: config.endpoint,
+            status: response.status,
+            statusText: response.statusText,
+            requestId: response.headers.get("X-Request-ID")
         });
 
         if (!response.ok) {
@@ -414,6 +509,11 @@ async function handleSubmit(event) {
         completeProgress(filename);
     } catch (error) {
         const detail = error.message || "Nao foi possivel concluir o processamento.";
+        debugLog("erro na submissao", {
+            tipo,
+            endpoint: config.endpoint,
+            erro: detail
+        });
         failProgress("Erro ao processar relatorio.", detail);
     } finally {
         setLoading(false);
